@@ -1,5 +1,7 @@
 theme: jekyll-theme-minimal
 
+logo: assets/images/amidine-logo-colour.png
+
 sidebar:
   - title: "Title"
     image: http://placehold.it/350x250
