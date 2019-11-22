@@ -1,6 +1,6 @@
 theme: jekyll-theme-minimal
 
-logo: assets/images/amidine-logo-colour.png
+logo: assets/images/amidine_logo_colour.png
 
 sidebar:
   - title: "Title"
