@@ -3,7 +3,7 @@ theme: jekyll-theme-minimal
 #title: AMIDiNe
 #description: Analytical Middleware for Informed Distribution Networks
 
-#logo: assets/images/amidine_logo_colour.png
+logo: assets/images/amidine_logo_regular_colour.png
 
 sidebar:
   - title: "Title"
