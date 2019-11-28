@@ -22,13 +22,15 @@
 
         <p>{{ site.description | default: site.github.project_tagline }}</p>
         
+        <p>
         <h1><li><a href="{{ "/wp1" | absolute_url }}""> Work Package 1 </a></li></h1>
         <h1><li><a href="{{ "/wp2" | absolute_url }}""> Work Package 2 </a></li></h1>
         <h1><li><a href="{{ "/wp3" | absolute_url }}""> Work Package 3 </a></li></h1>
         <h1><li><a href="{{ "people" | absolute_url }}""> People </a></li></h1>
         <h1><li><a href="{{ "prehistory" | absolute_url }}""> Prehistory </a></li></h1>
         <h1><li><a href="{{ "about" | absolute_url }}""> About </a></li></h1>
-        
+        </p>
+      
         {% if site.github.is_project_page %}
         <p class="view"><a href="{{ site.github.repository_url }}">View the Project on GitHub <small>{{ site.github.repository_nwo }}</small></a></p>
         {% endif %}
