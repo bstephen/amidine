@@ -1,4 +1,4 @@
-![](/assets/images/lv.jpg){: .center-image }
+![](/assets/images/lv.jpg){: .center-image}
 
 The programme of research that constitutes AMIDiNe will address the increasingly problematic management of electrical load on distribution networks as the UK transitions to a low carbon energy system. Traditionally, distribution networks had no observability and power flowed from large generation plant to be consumed by customers in this 'last mile'. Now, and even more so in future, those customers are generators themselves and the large generators that once supplied them have been supplanted by intermittent renewables. This scenario has left the GB energy system in position where it is servicing smaller demands at a regional or national level but faces abrupt changes in the face of weather and group changes in load behaviour, therefore it needs to be more informed on the behaviour of distribution networks. Increasing availability of Smart Meter data through the Data Communications Company has the potential to address this but only when placed within the context of analytical and physical models of the wider power system.
 
