@@ -1,0 +1,1697 @@
+---
+title: "Amidine --- Peak Timing Forecasting"
+author: "Ciaran Gilbert"
+date: "`r format(Sys.Date(),'%d-%m-%Y')`"
+output:
+  html_document:
+    code_folding: show
+    theme: united
+    number_sections: true
+    toc: true
+---
+
+<style>
+.main-container {
+    max-width: 1200px !important;
+}
+pre {
+  overflow-x: auto;
+}
+pre code {
+  word-wrap: normal;
+  white-space: pre;
+}
+</style>
+
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 800)
+```
+
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(
+ fig.width=15,fig.height=5,fig.align="center"
+)
+```
+
+
+First some required packages and functions for plotting/importing data
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+# options(repos='http://cran.rstudio.com/') ##restart?
+
+packages <- c("rmarkdown","cli","data.table","ggplot2","mgcv",
+              "gifski")
+
+install.packages(setdiff(packages, rownames(installed.packages())))
+
+rm(list=ls())
+
+library(data.table)
+library(ggplot2)
+library(ProbCast)
+
+data_imp_loc <- "../../data/"
+data_save <- "../../saved_data/"
+
+# include utility functions
+source("../amidine_utils/amidine_utils.R")
+
+ncores <- parallel::detectCores()
+
+
+### note in my ~/home/.Rprofile file I have configured R so it can use some paged memory for the big data processing
+### invisible(utils::memory.limit(64000))
+
+
+```
+
+Now let's load the data from the data exploration and preparation document
+
+
+```{r}
+
+load(paste0(data_save,"prep_expl_smfc_outv2.rda"))
+
+hier_ref
+
+
+```
+
+<!-- alternative peak definition (doesn't seem to have an effect at aggregatelevels, so let's just keep the first max each day) -->
+
+<!-- ```{r} -->
+
+
+<!-- lcl_data[,peak_ind := 0] -->
+<!-- # this is a weird line, but the inside term gets the rows in the larger table -->
+<!-- # where demand is maximum by group, returns V1 which is the row index of the larger table -->
+<!-- # not that this returns the first maxmum per day -->
+<!-- # lcl_data[lcl_data[, .I[which.max(demand)], by = .(date_uk,id)]$V1,peak_ind2:=1] -->
+<!-- lcl_data[lcl_data[, .I[tail(which(demand==max(demand)),1)], by = .(date_uk,id)]$V1,peak_ind:=1] -->
+
+<!-- # multiple peaks per day fn -->
+<!-- # lcl_data[,peak_ind_mult := 0] -->
+<!-- # lcl_data[lcl_data[, .I[demand == max(demand)], by = .(date_uk,id)]$V1,peak_ind_mult:=1] -->
+<!-- # lcl_data[peak_ind_mult==1 & peak_ind==0] -->
+<!-- # lcl_data[date=="2013-01-01" & id=="N0017"] -->
+<!-- # lcl_data[,peak_ind_mult:=NULL] -->
+
+<!-- # ok it seems we have the right number of peaks, each day has 780 -->
+<!-- lcl_data[peak_ind==1,.N,by=.(date_uk)][,unique(N)] -->
+<!-- lcl_data[peak_ind==1] -->
+
+
+
+
+
+<!-- ``` -->
+
+
+
+It might be also be useful to frame the problem in terms of a count problem. Let's create a new variable `n_hh_2peak`. Assuming we issue the forecasts at midnight this can be considered as the number of **half-hours** to peak demand from forecast issue time, i.e. midnight.
+
+- This variable will be within [1,48]
+- Clock changes at the moment are incorporated by the `tod_uk` variable
+     - change so we have 46 and 50 half hours at the clock change days?
+ 
+```{r}
+
+lcl_data[peak_ind==1,n_hh_2peak:=(tod_uk*2)+1]
+ 
+ 
+summary(lcl_data[peak_ind==1,.(peak_ind,id,date_time,demand,n_hh_2peak,tod_uk)])
+
+
+
+
+```
+
+Let's explore a few plots to refresh this problem. Here is some histograms showing some characteristics
+
+- note that the single afternoon peak at the ps1 level is christmas day
+- I think this is going to be a v. hard problem to model below the ps aggregation, let's see!
+
+```{r}
+
+
+ggplot(data=lcl_data[peak_ind==1],aes(n_hh_2peak))+
+  labs(x = "daily number of half hours to peak from midnight")+
+  geom_histogram(bins=48,colour="white",fill = "grey50")+
+  facet_wrap(~aggregation,nrow=2,scales = "free_y")
+
+
+```
+
+
+Let's just look at how the distribution looks at a few individual SMs
+
+- note the circularity at some of the IDS, N0956, N0342, N4087, etc..
+- a lot are clearly bi-modal in terms of afternoon/evening
+
+
+```{r}
+
+
+set.seed(111)
+smp_ids <- lcl_data[peak_ind==1 & aggregation=="sm",sample(unique(id),20)]
+smp_ids <- c("N0035","N0093",smp_ids[-c(1:2)])
+
+ggplot(data=lcl_data[peak_ind==1 & id%in%smp_ids],aes(n_hh_2peak))+
+  labs(x = "daily number of half hours to peak from midnight")+
+  geom_histogram(bins=48)+
+  facet_wrap(~id,nrow=4,scales = "free_y")
+
+
+```
+
+
+Let's have a look at the lag-dependency
+
+- looks reasonably strong during for evening peaks at all levels, outwith the evening, not so much
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+ggplot(data=lcl_data[peak_ind==1,.(todpk_l1=shift(n_hh_2peak,n=1L),n_hh_2peak,aggregation),by=.(id)],aes(y=n_hh_2peak,x= todpk_l1))+
+  labs(y = "daily number of half hours to peak from midnight",x = "lag1 daily number of half hours to peak from midnight")+
+  geom_hex(aes(fill = stat(ndensity)))+
+  theme(legend.position="top")+
+  facet_wrap(~aggregation,nrow=2)+
+  theme(legend.position="top")+guides(fill=guide_legend(nrow=1,byrow=TRUE))
+
+
+```
+
+
+We can also see the seasonal effect here at the `ps` aggregation clearly
+
+- as the peak demand increases, this happens in winter, and the time of peak is earlier as well
+ - ie. the `n_hh_2peak` variable decreases
+- this is the negative correlation we saw in a previous notebook
+
+
+```{r warning=FALSE}
+
+
+
+ggplot(data=lcl_data[peak_ind==1,.(demandpk_l1=shift(demand,n=1L),n_hh_2peak,aggregation),by=.(id)],aes(y=n_hh_2peak,x=demandpk_l1))+
+  labs(y = "daily number of half hours to peak from midnight",x = "lag1 peak demand [kWh]")+
+  geom_point()+
+  theme(legend.position="top")+
+  facet_wrap(~aggregation,nrow=2,scale="free")+ylim(1,48)+
+  theme(legend.position="top")+guides(fill=guide_legend(nrow=1,byrow=TRUE))
+
+
+
+```
+
+Let's have a closer look at `ps1`. Here is simply a time-series showing the change over the year
+
+- we can see that the dependency here is mainly seasonal imo
+- we could use a sunset time feature? would that be better than simple seasonality?
+- look at christmas! Could other earlier peaks be due to holidays?
+
+
+```{r}
+
+ggplot(data=lcl_data[peak_ind==1 & aggregation=="ps"],aes(x=date_uk,y=n_hh_2peak))+
+  labs(y = "daily number of half hours to peak from midnight", x = "date [uk]")+
+  geom_step(colour="steelblue",size=1.1)+ylim(1,48)+
+  facet_wrap(~id,nrow=1,scales = "free_y")
+
+```
+
+Now we inspect the series at the secondary substation level
+
+- we see that there is still a strong seasonal trend
+- some substations have earlier (10am) time-of-peak during the summer months, holidays?
+
+```{r}
+
+
+
+ggplot(data=lcl_data[peak_ind==1 & aggregation=="ss"],aes(x=date_uk,y=n_hh_2peak))+
+  labs(y = "daily number of half hours to peak from midnight", x = "date [uk]")+
+  geom_step(colour="steelblue")+ylim(0,48)+
+  facet_wrap(~id,nrow=2)
+
+
+
+```
+
+Now here at the feeder level things start to become more complicated
+
+- peak regularly happens in the morning at some feeders
+
+
+```{r}
+
+set.seed(111)
+smp_ids <- lcl_data[peak_ind==1 & aggregation=="fdr",sample(unique(id),8)]
+
+ggplot(data=lcl_data[peak_ind==1 & id%in%smp_ids],aes(x=date_uk,y=n_hh_2peak))+
+  labs(y = "daily number of half hours to peak from midnight", x = "date [uk]")+
+  geom_step(colour="steelblue")+ylim(0,48)+
+  facet_wrap(~id,nrow=2)
+
+
+```
+
+Finally let's inspect a random sample of 20 SMs
+
+- as we say in the peak intensity forecasting task the variability and predictability at this stage is much reduced
+- empirical pmf use at this level?
+- some peaks are occurring overnight
+- some, eg `N1961` happen consistently in the morning, and some, eg `N0948` have a clear changepoint
+- some are all over the place  :)
+
+
+```{r fig.height=10}
+
+
+set.seed(111)
+smp_ids <- lcl_data[peak_ind==1 & aggregation=="sm",sample(unique(id),20)]
+
+ggplot(data=lcl_data[peak_ind==1 & id%in%smp_ids],aes(x=date_uk,y=n_hh_2peak))+
+  labs(y = "daily number of half hours to peak from midnight", x = "date [uk]")+
+  geom_line(colour="steelblue")+ylim(0,48)+
+  facet_wrap(~id,nrow=4)
+
+
+
+
+```
+
+Here is the sin and cos components showing this where each dot is coloured by the the density of each point
+
+- in terms of a clock face 3 here means 6 am, 6 means 12pm, and so on....
+- you can see here that `N1961` has their peak demand during the morning pick up
+
+```{r fig.height=7.5}
+
+set.seed(111)
+smp_ids <- lcl_data[peak_ind==1 & aggregation=="sm",sample(unique(id),20)]
+
+ggplot(data=lcl_data[peak_ind==1 & id%in%smp_ids],aes(x=sin(tod_uk*2*pi/24),y=cos(tod_uk*2*pi/24)))+
+  labs(y = "cos(tod)", x = "sin(tod)")+
+  geom_hex(aes(fill = stat(ndensity)))+
+  facet_wrap(~id,nrow=4)
+
+rm(smp_ids)
+
+```
+Here is the peak time dependent on the day of the week. Looks like there's a bit of a weak relationship there.
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+ggplot(data=lcl_data[peak_ind==1,.(qoy,dow_uk,n_hh_2peak,aggregation),by=.(id)],aes(y=n_hh_2peak,x= as.character(dow_uk)))+
+  labs(y = "daily number of half hours to peak from midnight",x = "day of week, Sunday == 1, [-]")+
+  geom_boxplot()+
+  theme(legend.position="top")+
+  facet_grid(aggregation~1,scales = "free")+
+  theme(legend.position="top")+guides(fill=guide_legend(nrow=1,byrow=TRUE))
+
+
+```
+
+
+
+# Probabilistic time-of peak forecasting
+
+The task at hand here is to predict the time-of peak energy demand at the day-ahead scale for residential demand
+
+Let's just dive into doing some forecasting, we will start by chopping the data into 3 folds. We have 2 folds for cross validation and one for testing, obviously we don't have a very big dataset for estimation and evaluation. Therefore quantifying the uncertainty in evaluation metrics will be key.
+
+- we will divide each month into three fold chunks and take them as our folds, using the third chunk as our blind testing data
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+lcl_data[,kfold:=paste0("fold",ceiling(as.integer(format(date_uk,"%d"))/10))]
+lcl_data[kfold=="fold4",kfold:="fold1"]
+lcl_data[kfold=="fold3",kfold:="Test"]
+
+
+```
+
+
+
+## Generalized additive model approach to time-to-event analysis
+
+Here we frame the analysis as a time-to-event problem. So each day we have a maximum time to event of 24 hours, where the event is the daily peak demand. Interestingly time-to-event data can be modelled in a generalised additive model framework with some pre-processing and transformations of the data. This process is described extensively in this [paper](https://doi.org/10.1177%2F1471082X17748083).
+
+
+Essentially we first process our data where we say each day is a subject, in terms of survival analysis lingo. We then count the number of time intervals until the peak, i.e. event, is observed for each day. A final column is added which is our target variable, which is 0 until the event occurs.
+
+Here is an example of a subset of the data.table in it's current form for secondary substation 3 `ss3`
+
+
+```{r}
+
+
+lcl_data[id=="ss3" & peak_ind==1,.(date_time_uk,date_uk,kfold,tod_uk,doy_uk,peak_ind,n_hh_2peak,demand)]
+
+
+```
+
+
+Now we process this data.table into one suitable for the analysis
+
+- here now each `subject`, i.e. day, now has `n_hh_2peak` rows with a new indicator variable, `peak`, which is 0 until the peak is observed
+
+
+```{r}
+
+
+test <- lcl_data[id=="ss3" & peak_ind==1,.(kfold,
+                                           time_ind=1:n_hh_2peak,
+                                           tod_uk = ((1:n_hh_2peak)-1)/2,
+                                           doy_uk,
+                                           peak= c(rep(0,n_hh_2peak-1),1),
+                                           pk_demand = demand),by=.(id,date_uk)]
+
+
+test
+
+
+# test[date_uk%in%lcl_data[id=="ss1",.N,keyby=.(date_uk)][N!=48,date_uk][1]]
+# lcl_data[id=="ss3" & date_uk%in%lcl_data[id=="ss1",.N,keyby=.(date_uk)][N!=48,date_uk][1],.(date_uk,date_time_uk,tod_uk,id,n_hh_2peak,demand)]
+
+
+```
+
+
+Now let's fit a model with some nice cyclical time-of-day effects!
+
+- here is the model fit
+- and the cumulative probability of peak
+
+
+```{r animation.hook="gifski", interval = 2}
+
+
+
+ss3_model <- mgcv::gam(peak ~ s(time_ind,bs="cp"), data=test, family=binomial(),
+                       knots=list(time_ind=c(0,48)))
+
+
+plot(ss3_model)
+
+## some new data
+ex_data <- data.frame(time_ind=1:48)
+pred_hazard <- predict(ss3_model, newdata=data.frame(time_ind=1:48), type="response")
+pred_surv <- cumprod(1-pred_hazard)
+pred_prob <- 1-pred_surv
+# sum(diff(pred_prob)<0)
+
+
+
+
+pred_den <- c(pred_prob[1],diff(pred_prob))
+plot(((1:48)-1)/2,pred_hazard,xlab="time of day [uk]",ylab="hazard rate [-]",type="s",col="red")
+plot(((1:48)-1)/2,pred_surv,xlab="time of day [uk]",ylab="survival [-]",type="s",col="red")
+plot(((1:48)-1)/2,pred_prob,xlab="time of day [uk]",ylab="cdf [-]",type="s",col="red")
+plot(((1:48)-1)/2,pred_den,xlab="time of day [uk]",ylab="pdf [-]",type="s",col="red")
+lines(((1:48)-1)/2,c(1,pred_surv[1:47])*pred_hazard,type="s",col="black")
+
+
+# barplot(pred_hazard,xlab="time of day [uk]",ylab="probability of event",col="red")
+
+```
+
+
+
+
+Now let's fit a model with some nice cyclical time-of-day effects and day of year as well
+
+- here is the partial for both effects
+- and the cumulative probability of peak in a summer and winter day
+- nice!
+
+
+```{r animation.hook="gifski", interval = 2}
+
+
+
+ss3_model <- mgcv::gam(peak ~ s(time_ind,bs="cp") + s(doy_uk,bs="cp",k=4), data=test, family=binomial(),
+                       knots=list(time_ind=c(0,48),doy=c(0,365)))
+# ss3_model <- gamlss::gamlss(peak ~ pbc(time_ind,control = pbc.control(inter = 12),df=4) + 
+#                               pbc(doy_uk,control = pbc.control(inter = 12),df=4), data=test, family = BI)
+
+
+
+# plot(ss3_model,scale = 0,pages = 1)
+plot(ss3_model,scale = 0,pages = 1)
+
+## some new data
+ex_data <- data.frame(time_ind=1:48,doy_uk=2)
+pred_hazard <- predict(ss3_model, newdata=ex_data, type="response")
+pred_surv <- cumprod(1-pred_hazard)
+pred_prob <- 1-pred_surv
+# sum(diff(pred_prob)<0)
+
+
+plot(((1:48)-1)/2,pred_prob,xlab="time of day [uk]",ylab="probability of event",type="s",col="blue")
+
+
+ex_data <- data.frame(time_ind=1:48,doy_uk=200)
+pred_hazard <- predict(ss3_model, newdata=ex_data, type="response")
+pred_surv <- cumprod(1-pred_hazard)
+pred_prob <- 1-pred_surv
+# sum(diff(pred_prob)<0)
+
+lines(((1:48)-1)/2,pred_prob,type="s",col="red")
+legend("topleft", legend=c("summer", "winter"),col=c("red", "blue"), lty=rep(1, 2))
+
+
+
+```
+
+
+
+
+## Aggregate levels
+
+
+Ok let's fit these models across all levels aggregate levels of the hierarchy. First let's engineer some features for the regression
+
+
+
+```{r}
+## lagged peak
+lcl_data[peak_ind==1,demandpk_l1:=shift(demand,n=1L),by=.(id)]
+lcl_data[peak_ind==1,demandpk_l7:=shift(demand,n=7L),by=.(id)]
+
+# lagged n_hh2peak
+lcl_data[peak_ind==1,n_hh_2peak_l1:=shift(n_hh_2peak,n=1L),by=.(id)]
+lcl_data[peak_ind==1,n_hh_2peak_l7:=shift(n_hh_2peak,n=7L),by=.(id)]
+
+
+## lagged daily variance
+lcl_data[,dvar_demand:=var(demand),by=.(date_uk,id)]
+lcl_data[peak_ind==1,dvar_demand_l1:=shift(dvar_demand,n=1L),by=.(id)]
+
+## weekday/weekend feature
+lcl_data[,dow_ftr:=1]
+lcl_data[dow_uk%in%c(1,7),dow_ftr:=0]
+
+
+```
+
+
+<!-- ```{r} -->
+
+
+
+<!-- ggplot(data=lcl_data[peak_ind==1],aes(y=n_hh_2peak,x=sqrt(dvar_demand_l1)))+ -->
+<!--   labs(y = "peak demand [kWh]",x = "peak demand lag1 [kWh]")+ -->
+<!--   geom_point()+ -->
+<!--   facet_wrap(~aggregation,nrow=2,scales="free")+ -->
+<!--   theme(legend.position="top")+guides(fill=guide_legend(nrow=1,byrow=TRUE)) -->
+
+
+
+
+
+<!-- ``` -->
+
+Let's now generate the model fitting frame
+
+
+```{r}
+
+
+
+pamm_data <- lcl_data[peak_ind==1,.(kfold,
+                                    time_ind=1:n_hh_2peak,
+                                    tod_uk = ((1:n_hh_2peak)-1)/2,
+                                    doy_uk,
+                                    peak = c(rep(0,n_hh_2peak-1),1),
+                                    demandpk = demand,
+                                    demandpk_l1,
+                                    demandpk_l7,
+                                    n_hh_2peak_l1,
+                                    n_hh_2peak_l7,
+                                    dvar_demand_l1,
+                                    dow_ftr),keyby=.(aggregation,id,date_uk)]
+
+
+pamm_data <- pamm_data[doy_uk>7]
+
+
+pamm_data
+
+
+```
+
+
+Let's check each day we have an event, all good!
+
+
+```{r}
+
+pamm_data[peak==1,.N,keyby=.(id)]
+
+
+```
+
+### benchmark seasonal climatology
+
+first let's compute a competitive benchmark, a simple seasonal climatology
+
+- here are the predictions for the `ps` level
+
+
+```{r}
+
+
+
+
+pamm_data[,moy:=month(date_uk)]
+pamm_data[,seas:="winter"]
+pamm_data[moy>=3,seas:="spring"]
+pamm_data[moy>=6,seas:="summer"]
+pamm_data[moy>=9,seas:="autumn"]
+pamm_data[moy>=12,seas:="winter"]
+
+
+
+agg_models <- list()
+agg_models$bench <- pamm_data[peak==1 & aggregation!="sm",as.list(clim_top(.SD,
+                                                                           cv_folds = "kfold",
+                                                                           target_col = "time_ind",
+                                                                           by_cols = "seas")),keyby=.(id)]
+
+
+agg_models$bench <- split(agg_models$bench,by="id",sorted = TRUE,keep.by=FALSE,flatten = FALSE)
+invisible(lapply(agg_models$bench,function(x){setorderv(x,cols="date_uk")}))
+
+agg_ids <- names(agg_models$bench)
+agg_models$bench <- lapply(agg_ids,function(x){
+  
+  list(prob_pred=agg_models$bench[[x]][,-c(1:3)])
+  
+})
+names(agg_models$bench) <- agg_ids
+
+
+agg_models$bench$ps1$prob_pred
+
+```
+
+### GAM
+
+Ok let's fit a simple model now for all the ids in the aggregated levels using the generalised additive model structure. Some notes from exploratory analysis in `mgcv`
+
+
+- First have a look at the different model formulations in `m1` to `m7`
+
+
+```{r warning = F, fig.height = 7.5, results = 'hide'}
+
+
+
+# plain cubic spline
+agg_models$m1 <- ml_pc_mgcv(melted_dt = pamm_data[aggregation!="sm"],
+                            vars = c("peak"),
+                            split_col = "id",
+                            sort_cols = c("date_uk","time_ind"),
+                            formula = peak ~ s(time_ind,bs="cr"),
+                            cv_folds = "kfold",
+                            ncores = ncores,
+                            ncores_inner = 1L,
+                            family = stats::binomial())
+
+# cyclical p-spline with with max df
+agg_models$m2 <- ml_pc_mgcv(melted_dt = pamm_data[aggregation!="sm"],
+                            vars = c("peak"),
+                            split_col = "id",
+                            sort_cols = c("date_uk","time_ind"),
+                            formula = peak ~ s(time_ind,bs="cp", k = 20),
+                            knots=list(time_ind=c(0,48)),
+                            cv_folds = "kfold",
+                            ncores = ncores,
+                            ncores_inner = 1L,
+                            family = stats::binomial())
+
+# including day-of year
+agg_models$m3 <- ml_pc_mgcv(melted_dt = pamm_data[aggregation!="sm"],
+                            vars = c("peak","doy_uk"),
+                            split_col = "id",
+                            sort_cols = c("date_uk","time_ind"),
+                            formula = peak ~ s(time_ind,bs="cp", k = 20) + s(doy_uk,bs="cp", k = 12),
+                            knots=list(time_ind=c(0,48),doy_uk=c(0,365)),
+                            cv_folds = "kfold",
+                            ncores = ncores,
+                            ncores_inner = 1L,
+                            family = stats::binomial())
+
+
+
+## these take a bit of time, so save and load
+l_file <- TRUE
+if(file.exists(paste0(data_save,"timing_agg_m4.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"timing_agg_m4.rda"))
+} else{
+  
+  # time-of-day and day of year interaction - takes a bit of time
+  agg_timing <- ml_pc_mgcv(melted_dt = pamm_data[aggregation!="sm"],
+                            vars = c("peak","doy_uk"),
+                            split_col = "id",
+                            sort_cols = c("date_uk","time_ind"),
+                            formula = peak ~ te(doy_uk,time_ind,bs=c("cp","cp"), k = 10),
+                            knots=list(time_ind=c(0,48),doy_uk=c(0,365)),
+                            cv_folds = "kfold",
+                            ncores = ncores,
+                            ncores_inner = 1L,
+                            family = stats::binomial())
+  
+  
+  save(agg_timing,file = paste0(data_save,"timing_agg_m4.rda"))
+  
+}
+
+
+
+agg_models$m4 <- agg_timing
+
+
+
+pamm_data[,dow_ftr:= as.factor(dow_ftr)]
+l_file <- TRUE
+if(file.exists(paste0(data_save,"timing_agg_m5.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"timing_agg_m5.rda"))
+} else{
+  
+  # time-of-day and day of year interaction - takes a bit of time
+  agg_timing <- ml_pc_mgcv(melted_dt = pamm_data[aggregation!="sm"],
+                            vars = c("peak","doy_uk","dow_ftr"),
+                            split_col = "id",
+                            sort_cols = c("date_uk","time_ind"),
+                            formula = peak ~ te(doy_uk,time_ind,bs=c("cp","cp"), k = 10) + dow_ftr,
+                            knots=list(time_ind=c(0,48),doy_uk=c(0,365)),
+                            cv_folds = "kfold",
+                            ncores = ncores,
+                            ncores_inner = 1L,
+                            family = stats::binomial())
+  
+  save(agg_timing,file = paste0(data_save,"timing_agg_m5.rda"))
+  
+}
+
+agg_models$m5 <- agg_timing
+
+
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"timing_agg_m6.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"timing_agg_m6.rda"))
+} else{
+  
+  # time-of-day and day of year interaction - takes a bit of time
+  agg_timing <- ml_pc_mgcv(melted_dt = pamm_data[aggregation!="sm"],
+                            vars = c("peak","doy_uk","dow_ftr","n_hh_2peak_l1"),
+                            split_col = "id",
+                            sort_cols = c("date_uk","time_ind"),
+                            formula = peak ~ te(doy_uk,time_ind,bs=c("cp","cp"), k = 10) + dow_ftr + n_hh_2peak_l1,
+                            knots=list(time_ind=c(0,48),doy_uk=c(0,365)),
+                            cv_folds = "kfold",
+                            ncores = ncores,
+                            ncores_inner = 1L,
+                            family = stats::binomial())
+  
+  save(agg_timing,file = paste0(data_save,"timing_agg_m6.rda"))
+  
+}
+
+agg_models$m6 <- agg_timing
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"timing_agg_m7.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"timing_agg_m7.rda"))
+} else{
+  
+  # time-of-day and day of year interaction - takes a bit of time
+  agg_timing <- ml_pc_mgcv(melted_dt = pamm_data[aggregation!="sm"],
+                            vars = c("peak","doy_uk","dow_ftr","n_hh_2peak_l1"),
+                            split_col = "id",
+                            sort_cols = c("date_uk","time_ind"),
+                            formula = peak ~ te(doy_uk,time_ind,bs=c("cp","cp"), k = 10) + dow_ftr + s(n_hh_2peak_l1),
+                            knots=list(time_ind=c(0,48),doy_uk=c(0,365)),
+                            cv_folds = "kfold",
+                            ncores = ncores,
+                            ncores_inner = 1L,
+                            family = stats::binomial())
+  
+  save(agg_timing,file = paste0(data_save,"timing_agg_m7.rda"))
+  
+}
+
+agg_models$m7 <- agg_timing
+
+
+lapply(agg_models,function(x){x$ps1$models$Test$formula})
+
+
+
+```
+
+
+From inspection of the RPS results
+
+- seems like cyclical penalised splines work reasonably well, when you keep `k` high in the formula --> `m1` to `m2`
+- day of year is massively important for skill, in `m3`
+- seasonal interactions are clearly important, especially at feeder level, in `m4`
+- binomial family, rather than poisson is better as well (not shown), why?!
+- adding the demand intensity lag didn't help much (not shown)
+- best model it seems to me includes the weekend/weekday factor and the tensor seasonal spline, `m5`, when considering the cross validation and testing scores across the aggregate levels
+- also we only have a only year to learn the day-of-year seasonal and interaction effect, but it's obviously very important. Discuss further?
+
+
+```{r warning = F, fig.height = 7.5, results = 'hide'}
+
+
+
+##### evaluate using rps
+eval_agg <- list()
+
+eval_agg <- lapply(names(agg_models), function(x){
+  
+  xtr_fc <- lapply(agg_models[[x]],function(z){z$prob_pred})
+  names(xtr_fc) <- names(agg_models[[x]])
+  
+  
+  rps <- rbindlist(ml_eval_cat(fc_list = xtr_fc,
+                               metric = "rps",
+                               melted_dt = pamm_data[aggregation!="sm" & peak==1],
+                               obs_col = "time_ind",
+                               split_col = "id",
+                               sort_cols = c("date_uk","aggregation")),idcol = "id")
+
+  rps[kfold!="Test",kfold:="All_cv"]
+  return(rps)
+  
+  
+})
+
+names(eval_agg) <- names(agg_models)
+
+
+
+boot_data <- cbind(eval_agg$bench,
+                   eval_agg$m1[,.(m1=rps)],
+                   eval_agg$m2[,.(m2=rps)],
+                   eval_agg$m3[,.(m3=rps)],
+                   eval_agg$m4[,.(m4=rps)],
+                   eval_agg$m5[,.(m5=rps)],
+                   eval_agg$m6[,.(m6=rps)],
+                   eval_agg$m7[,.(m7=rps)])
+
+
+setnames(boot_data,"rps","bench")
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+# set.seed(1101)
+# smp_ids <- lcl_data[peak_ind==1 & aggregation!="sm",sample(unique(id),4)]
+# smp_ids
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "rps improvement over bench [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+```
+
+
+Here is the skill score at the different nodes of `m5`, where `m1` is the reference model. Looks like we have significant improvement everywhere almost. But obviously the improvement is much more pronounced at the higher aggregation levels
+
+```{r fig.height = 7.5}
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","id","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+
+boot_dt[model_id=="m5",ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "rps improvement over bench [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(aggregation~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+Let's have a closer look at `m5` which seems to be the top model in terms of both CV and testing improvement on the previous formulation at the different levels of the hierarchy. Ok we can see that the model is made of a tensor smooth and a factor variable. Surprisingly the `dow_ftr` coefficient is picked as significant, even though the skill improvement isn't that significant at the `ps1` level compared to `m4`
+
+
+```{r}
+
+
+summary(agg_models$m5$ps1$models$Test)
+
+
+```
+
+
+Here is an inspection of the smooth tensor fit via `m5` at the `ps1` level. This shows that the interaction term at this level is only really important in the evening as expected. The response of the linear predictor is similar past 8pm during the summer to the response in the evening during the winter.
+
+It also shows the circular nature of the smooth in the two dimensions.
+
+```{r}
+
+plot(agg_models$m5$ps1$models$Test,rug = T,residuals = T,cex=1,pages=1,scale = 0,scheme = 2)
+
+
+# vis.gam(agg_models$m5$ps1$models$Test,theta=-40,plot.type = "persp",color = "heat",view=c("time_ind","doy_uk"));title("tensor product")
+
+
+```
+
+
+Here are some example forecasts
+
+
+
+```{r animation.hook="gifski", interval = 0.25}
+
+set.seed(10)
+# par(mfrow=c(2,2))
+for (i in sort(sample(20:350,30))){
+plot(((1:48)-1)/2,agg_models$bench$ps1$prob_pred[i,],col=2,main=paste0("doy = ",i),
+     ylab="prob of peak [-]",xlab = "time of day [-]",type="s")
+abline(v=pamm_data[peak==1 & id=="ps1"][i,(time_ind-1)/2],lty=2)
+lines(((1:48)-1)/2,agg_models$m3$ps1$prob_pred[i,],col=3,type="s")
+lines(((1:48)-1)/2,agg_models$m5$ps1$prob_pred[i,],col=4,type="s")
+legend("topleft",c("bench","m3","m5"),col = 2:4,lty=1,lwd=1)
+}
+
+
+```
+
+
+Let's have a closer look at `m5` at a lower aggregation level, `ss2_fdr3`.
+
+```{r}
+
+
+summary(agg_models$m5$ss2_fdr3$models$Test)
+
+
+```
+
+
+Here is an inspection of the smooth tensor fit via `m5` at the `ss2_fdr3` level. This is where the interaction becomes really interesting. During the summer we see the increased probability of the peak coming later in the evening, but also the probability of the peak in the afternoon increasing when compared to winter. This effect is also present in the exploratory graphs shown previously.
+
+
+```{r}
+
+plot(agg_models$m5$ss2_fdr3$models$Test,rug = T,residuals = T,cex=1,pages=1,scale = 0,scheme = 2)
+
+
+# vis.gam(agg_models$m5$ss2_fdr3$models$Test,theta=-40,plot.type = "persp",color = "heat",view=c("time_ind","doy_uk"));title("tensor product")
+
+
+```
+
+
+
+```{r animation.hook="gifski", interval = 0.25}
+
+set.seed(10)
+# par(mfrow=c(2,2))
+for (i in sort(sample(20:350,30))){
+plot(((1:48)-1)/2,agg_models$bench$ss1_fdr4$prob_pred[i,],col=2,main=paste0("doy = ",i),
+     ylab="prob of peak [-]",xlab = "time of day [-]",type="s")
+abline(v=pamm_data[peak==1 & id=="ss2_fdr3"][i,(time_ind-1)/2],lty=2)
+lines(((1:48)-1)/2,agg_models$m3$ss2_fdr3$prob_pred[i,],col=3,type="s")
+lines(((1:48)-1)/2,agg_models$m5$ss2_fdr3$prob_pred[i,],col=4,type="s")
+legend("topleft",c("bench","m3","m5"),col = 2:4,lty=1,lwd=1)
+}
+
+
+```
+
+
+Ok so we have probability forecasts, let's normalise them first so they sum to 1 and convert them into quantile forecasts. This will allow us to easily visualise multiple forecasts and evaluate them using a multicategory reliability diagram.
+
+This 'new' forecasting model with appropriate normalisation of the probabilities is termed `m8`. Note that the scaling of the probabilities is really minimal and there is no change in skill between model 5 and 8 as expected.
+
+
+
+```{r}
+
+
+agg_models$m8 <- agg_models$m5
+
+agg_models$m8 <- lapply(names(agg_models$m8),function(x){
+  
+  
+  agg_models$m8[[x]]$prob_pred <- data.table(t(apply(agg_models$m8[[x]]$prob_pred,1,function(z){
+    
+    z[z>1] <- 1
+    
+    z <- z+((1-max(z))/max(z))*z
+    
+  })))
+  
+  return(agg_models$m8[[x]])
+  
+  
+  
+})
+
+names(agg_models$m8) <- names(agg_models$m5)
+
+
+
+eval_agg <- append(eval_agg,lapply("m8", function(x){
+  
+  xtr_fc <- lapply(agg_models[[x]],function(z){z$prob_pred})
+  names(xtr_fc) <- names(agg_models[[x]])
+  
+  
+  rps <- rbindlist(ml_eval_cat(fc_list = xtr_fc,
+                               metric = "rps",
+                               melted_dt = pamm_data[aggregation!="sm" & peak==1],
+                               obs_col = "time_ind",
+                               split_col = "id",
+                               sort_cols = c("date_uk","aggregation")),idcol = "id")
+
+  rps[kfold!="Test",kfold:="All_cv"]
+  return(rps)
+  
+  
+}))
+
+names(eval_agg) <- names(agg_models)
+
+
+
+boot_data <- cbind(eval_agg$bench,
+                   eval_agg$m5[,.(m5=rps)],
+                   eval_agg$m8[,.(m8=rps)])
+
+setnames(boot_data,"rps","bench")
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+# set.seed(1101)
+# smp_ids <- lcl_data[peak_ind==1 & aggregation!="sm",sample(unique(id),4)]
+# smp_ids
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "rps improvement over bench [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free")
+        +theme(legend.position="top")]
+
+
+
+
+
+```
+
+Now checking the calibration of these predictions is very tricky. We will use **multicategory reliability diagrams** which are described in this [paper](https://doi.org/10.1175/1520-0434(1997)012%3C0736:RDFMPF%3E2.0.CO;2). These are very similar to normal reliability diagrams except
+  
+  - when the obs==fc the indicator function is spread across the categories
+  - we calculate the calibration of quantiles of the probability forecast
+
+Therefore we need to transform our cumulative probability predictions into quantile forecasts. We will use a simple approximation for that. Remember here that the categories represent the **probability in each half hour block**. So between 00:00 and 00:29:999.... this is represented by the first category. So if the quantile required lies between 0 and the first column prediction i.e. the extreme left tail usually in the aggregated case, it will return the first column category.
+
+```{r}
+
+
+
+y0 <- unlist(agg_models$m3$ss3_fdr1$prob_pred[170,])
+y0 <- y0+((1-max(y0))/max(y0))*y0
+y0 <- c(0,y0)
+
+
+# approxfun(x = y0[1:(length(y0)-1)],y = 1:48,method = "constant",rule = 2)(0.0001705528)
+
+plot(approxfun(x = y0[1:(length(y0)-1)],y = 1:48,method = "constant",rule = 2)(seq(0,1,1e-5)),
+     seq(0,1,1e-5),type="l",col="red")
+y0 <- unlist(agg_models$m3$ss3_fdr1$prob_pred[170,])
+y0 <- y0+((1-max(y0))/max(y0))*y0
+points(1:48,y0)
+
+
+```
+
+
+Example forecasts from `m1`, `m3`, `m4`, and `m8` are shown below for the locations fitted so far using fan plots. It seems to me we might be in danger of overfitting some of the yearly seasonal terms. More data required?!
+
+
+```{r fig.height= 7.5, animation.hook="gifski", interval = 0.5, results = "hide", warning = F}
+
+## generate MQR objects
+model_ids <- names(agg_models)
+agg_models <- lapply(model_ids,function(x){
+  
+  loc_ids <- names(agg_models[[x]])
+  
+  agg_models[[x]] <- lapply(loc_ids,function(y){
+  
+  
+  agg_models[[x]][[y]]$mqr_pred <- data.frame(t(apply(agg_models[[x]][[y]]$prob_pred,1,function(z){
+    
+    approxfun(x = c(0,z[1:(length(z)-1)]),y = 1:48,method = "constant",rule = 2)(c(0.01,seq(0.05,0.95,0.05),.99))
+    
+  })))
+  
+  colnames(agg_models[[x]][[y]]$mqr_pred) <- paste0("q",c(0.01,seq(0.05,0.95,0.05),.99)*100)
+  class(agg_models[[x]][[y]]$mqr_pred) <- c("MultiQR",class(agg_models[[x]][[y]]$mqr_pred))
+  
+  return(agg_models[[x]][[y]])
+  })
+  
+  names(agg_models[[x]]) <- loc_ids
+  
+  return(agg_models[[x]])
+  
+  
+})
+
+names(agg_models) <- model_ids
+  
+  
+
+
+
+# set.seed(1101)
+# smp_ids <- lcl_data[peak_ind==1 & aggregation!="sm",sample(unique(id),4)]
+# smp_ids
+
+
+par(mfrow=c(2,2))
+for(i in names(agg_models$m8)){
+  
+  plot(agg_models$bench[[i]]$mqr_pred,q50_line = TRUE,main=paste0(i," --- bench"),
+       cols = colorRampPalette(c("gold", "red")),ylim=c(0,50))
+  lines(pamm_data[id==i & peak==1,time_ind],type = "s")
+  abline(h=48,lty=2,col="red")
+  
+  
+    plot(agg_models$m3[[i]]$mqr_pred,q50_line = TRUE,main=paste0(i," --- m3 --- f(tod) + f(doy)"),
+       cols = colorRampPalette(c("gold", "red")),ylim=c(0,50))
+  lines(pamm_data[id==i & peak==1,time_ind],type = "s")
+  abline(h=48,lty=2,col="red")
+  
+
+
+  plot(agg_models$m4[[i]]$mqr_pred,q50_line = TRUE,main=paste0(i," --- m4 --- f(tod,doy)"),
+       cols = colorRampPalette(c("gold", "red")),ylim=c(0,50))
+  lines(pamm_data[id==i & peak==1,time_ind],type = "s")
+  abline(h=48,lty=2,col="red")
+
+  plot(agg_models$m8[[i]]$mqr_pred,q50_line = TRUE,main=paste0(i," --- m8 --- f(tod,doy) + wkdy/wknd"),
+       cols = colorRampPalette(c("gold", "red")),ylim=c(0,50))
+  lines(pamm_data[id==i & peak==1,time_ind],type = "s")
+  abline(h=48,lty=2,col="red")
+
+  
+  
+}
+
+
+
+
+
+
+```
+
+Now here are the multi-category reliability diagrams.The reliability seems to be very good during cross validation. In the advanced model `m8` we also have an improved calibration compared to the benchmark `m1` model.
+
+
+
+```{r}
+
+
+
+eval_agg_rel <- list()
+
+eval_agg_rel <- lapply(names(agg_models), function(x){
+  
+  xtr_fc <- lapply(agg_models[[x]],function(z){z$mqr_pred})
+  names(xtr_fc) <- names(agg_models[[x]])
+  
+  
+  rps <- rbindlist(ml_eval_cat(fc_list = xtr_fc,
+                               metric = "mcrd",
+                               melted_dt = pamm_data[aggregation!="sm" & peak==1],
+                               obs_col = "time_ind",
+                               split_col = "id",
+                               mcrd_sort = "aggregation",
+                               mcrd_kfoldall = TRUE,
+                               nboot = 100,
+                               sort_cols = c("date_uk","aggregation")),idcol = "id")
+
+  return(rps)
+  
+  
+})
+
+names(eval_agg_rel) <- names(agg_models)
+
+
+temprel <- rbindlist(eval_agg_rel,idcol = "model")
+
+ggplot(data=temprel[model%in%c("bench","m8")],aes(x=Nominal)) + 
+  labs(y = "empirical coverage [-]", x = "nominal coverage [-]") + 
+  geom_line(aes(y = Empirical,group =  id,colour = model)) +
+  geom_point(aes(y = Empirical, group =  id,colour=model), size = 1) +
+  # geom_errorbar(aes(ymin=lower,ymax=upper,group=id))+
+  geom_line(aes(y=Nominal),colour = "black", linetype = "dashed") + 
+  facet_grid(aggregation~kfold+model) + 
+  theme(legend.position="top")+guides(colour = guide_legend(nrow = 1))
+
+```
+
+
+
+## Household level
+
+
+Let's inspect a random subsample of samrt meters at `ss4`
+
+- I think we're best just going for a simple model here, these are all over the place
+
+
+```{r fig.height=10}
+
+
+set.seed(1)
+smp_ids <- lcl_data[aggregation=="sm" & ss_id=="ss4",sample(unique(id),20)]
+
+ggplot(data=lcl_data[peak_ind==1 & id%in%smp_ids],aes(x=date_uk,y=n_hh_2peak))+
+  labs(y = "daily number of half hours to peak from midnight", x = "date [uk]")+
+  geom_line(colour="steelblue")+ylim(0,48)+
+  facet_wrap(~id,nrow=4)
+
+
+
+
+```
+
+
+### Benchmark seasonal climatology
+
+First let's compute a competitive benchmark, a simple seasonal climatology
+
+- here are the predictions the `N0000` smart meter
+
+
+```{r}
+
+
+sm_models <- list()
+sm_models$bench <- pamm_data[peak==1 & aggregation=="sm",as.list(clim_top(.SD,
+                                                                           cv_folds = "kfold",
+                                                                           target_col = "time_ind",
+                                                                           by_cols = "seas")),keyby=.(id)]
+
+
+sm_models$bench <- split(sm_models$bench,by="id",sorted = TRUE,keep.by=FALSE)
+invisible(lapply(sm_models$bench,function(x){setorderv(x,cols="date_uk")}))
+
+sm_ids <- names(sm_models$bench)
+sm_models$bench <- lapply(sm_ids,function(x){
+  
+  list(prob_pred=sm_models$bench[[x]][,-c(1:3)])
+  
+})
+names(sm_models$bench) <- sm_ids
+
+
+sm_models$bench$N0000$prob_pred
+
+```
+
+
+### GAM
+
+Ok let's fit a simple model now for all the ids in the smart meter level. Some notes from exploratory analysis in `mgcv`
+
+- here are the model formulas used
+- note that **the model formulas are slightly different to the aggregated levels**, e.g. the circular spline for time of day is only in `m2`
+- we will chose a relatively low k here for the splines, which should split the splines into two hour blocks over the time of day (and 1 month for day of year)
+  - high k was failing at some nodes
+- `m4` is the `m3` model formulation with normalisation of the probabilities to sum to 1
+
+
+```{r warning = F, fig.height = 7.5, results = 'hide'}
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"timing_sm_m1.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"timing_sm_m1.rda"))
+} else{
+  
+  # plain cubic spline
+  sm_timing <- ml_pc_mgcv(melted_dt = pamm_data[aggregation=="sm"],
+                          vars = c("peak"),
+                          split_col = "id",
+                          sort_cols = c("date_uk","time_ind"),
+                          formula = peak ~ s(time_ind,bs="cr"),
+                          cv_folds = "kfold",
+                          ncores = ncores,
+                          ncores_inner = 1L,
+                          family = stats::binomial())
+  
+  save(sm_timing,file = paste0(data_save,"timing_sm_m1.rda"))
+  
+}
+
+sm_models$m1 <- sm_timing
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"timing_sm_m2.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"timing_sm_m2.rda"))
+} else{
+  
+  # cyclical p-spline with with max df
+  sm_timing <- ml_pc_mgcv(melted_dt = pamm_data[aggregation=="sm"],
+                          # sm_models$m2 <- ml_pc_mgcv(melted_dt = pamm_data[id%in%smp_ids],
+                          vars = c("peak"),
+                          split_col = "id",
+                          sort_cols = c("date_uk","time_ind"),
+                          formula = peak ~ s(time_ind,bs="cp", k = 12),
+                          knots=list(time_ind=c(0,48)),
+                          cv_folds = "kfold",
+                          ncores = ncores,
+                          ncores_inner = 1L,
+                          family = stats::binomial())
+  
+  save(sm_timing,file = paste0(data_save,"timing_sm_m2.rda"))
+  
+}
+
+sm_models$m2 <- sm_timing
+
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"timing_sm_m3.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"timing_sm_m3.rda"))
+} else{
+  
+  # including day-of year, cubic spline for time of day
+  sm_timing <- ml_pc_mgcv(melted_dt = pamm_data[aggregation=="sm"],
+                          # sm_models$m3 <- ml_pc_mgcv(melted_dt = pamm_data[id%in%smp_ids],
+                          vars = c("peak","doy_uk"),
+                          split_col = "id",
+                          sort_cols = c("date_uk","time_ind"),
+                          formula = peak ~ s(time_ind,bs="cr", k = 12) + s(doy_uk,bs="cp", k = 12),
+                          knots=list(doy_uk=c(0,365)),
+                          cv_folds = "kfold",
+                          ncores = ncores,
+                          ncores_inner = 1L,
+                          family = stats::binomial())
+  
+  
+  save(sm_timing,file = paste0(data_save,"timing_sm_m3.rda"))
+  
+}
+
+sm_models$m3 <- sm_timing
+rm(sm_timing)
+invisible(gc())
+
+
+######### m3 with normalised probabilities
+sm_models$m4 <- sm_models$m3
+
+sm_models$m4 <- lapply(names(sm_models$m4),function(x){
+  
+  
+  sm_models$m4[[x]]$prob_pred <- data.table(t(apply(sm_models$m4[[x]]$prob_pred,1,function(z){
+    
+    z[z>1] <- 1
+    
+    z <- z+((1-max(z))/max(z))*z
+    
+  })))
+  
+  return(sm_models$m4[[x]])
+  
+  
+  
+})
+
+names(sm_models$m4) <- names(sm_models$m3)
+
+
+lapply(sm_models,function(x){x[[1]]$models$Test$formula})
+
+
+
+```
+
+
+
+
+<!-- ```{r} -->
+<!-- # # time-of-day and day of year interaction - takes a bit of time -->
+<!-- # sm_models$m4 <- ml_pc_mgcv(melted_dt = pamm_data[id%in%smp_ids], -->
+<!-- #                            vars = c("peak","doy_uk"), -->
+<!-- #                            split_col = "id", -->
+<!-- #                            sort_cols = c("date_uk","time_ind"), -->
+<!-- #                            formula = peak ~ te(doy_uk,time_ind,bs=c("cp","cr"), k = 10), -->
+<!-- #                            knots=list(doy_uk=c(0,365)), -->
+<!-- #                            cv_folds = "kfold", -->
+<!-- #                            ncores = ncores, -->
+<!-- #                            ncores_inner = 1L, -->
+<!-- #                            family = stats::binomial()) -->
+<!-- #  -->
+<!-- #  -->
+<!-- #  -->
+<!-- # pamm_data[,dow_ftr:= as.factor(dow_ftr)] -->
+<!-- # # time-of-day and day of year interaction - takes a bit of time -->
+<!-- # sm_models$m5 <- ml_pc_mgcv(melted_dt = pamm_data[id%in%smp_ids], -->
+<!-- #                            vars = c("peak","doy_uk","dow_ftr"), -->
+<!-- #                            split_col = "id", -->
+<!-- #                            sort_cols = c("date_uk","time_ind"), -->
+<!-- #                            formula = peak ~ te(doy_uk,time_ind,bs=c("cp","cr"), k = 10) + dow_ftr, -->
+<!-- #                            knots=list(doy_uk=c(0,365)), -->
+<!-- #                            cv_folds = "kfold", -->
+<!-- #                            ncores = ncores, -->
+<!-- #                            ncores_inner = 1L, -->
+<!-- #                            family = stats::binomial()) -->
+
+
+<!-- lapply(sm_models,function(x){x[[1]]$models$Test$formula}) -->
+
+
+<!-- ``` -->
+
+Some thoughts on the results 
+
+- the circular spline for time of day seems to not be as applicable at this level, `m2` to `m1`
+- The interaction term takes far too long to fit at this level of aggregation
+  - tested at subsample, and the improvement of to `m3` was significant but only ~1% in CV and ~0.5% in testing
+  - not really worth the time
+  - plus at this aggregation I think it's beneficial to go for a simple but robust model, as with the intensity
+- the `m3` model gives significant improvement over the benchmark - nice!
+- the test set is more difficult to forecast, even seasonal cimatology get's worse, not sure overfitting is the problem....
+
+
+
+```{r warning = F,results = 'hide'}
+
+
+##### evaluate using rps - takes a while so save and load - takes 1.5hrs!!
+l_file <- TRUE
+if(file.exists(paste0(data_save,"timing_evalrps_sm.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"timing_evalrps_sm.rda"))
+} else{
+  
+  # time-of-day and day of year interaction - takes a bit of time
+  t1 <- proc.time()
+  eval_sm <- lapply(names(sm_models), function(x){
+    
+    xtr_fc <- lapply(sm_models[[x]],function(z){z$prob_pred})
+    names(xtr_fc) <- names(sm_models[[x]])
+    
+    
+    rps <- rbindlist(ml_eval_cat(fc_list = xtr_fc,
+                                 metric = "rps",
+                                 melted_dt = pamm_data[aggregation=="sm" & peak==1],
+                                 # melted_dt = pamm_data[id%in%smp_ids & peak==1],
+                                 obs_col = "time_ind",
+                                 split_col = "id",
+                                 sort_cols = c("date_uk","aggregation")),idcol = "id")
+    
+    rps[kfold!="Test",kfold:="All_cv"]
+    return(rps)
+    
+    
+  })
+  print(proc.time()-t1)
+  
+  names(eval_sm) <- names(sm_models)
+  
+  
+  save(eval_sm,file = paste0(data_save,"timing_evalrps_sm.rda"))
+  
+}
+
+
+
+boot_data <- cbind(eval_sm$bench,
+                   eval_sm$m1[,.(m1=rps)],
+                   eval_sm$m2[,.(m2=rps)],
+                   eval_sm$m3[,.(m3=rps)],
+                   eval_sm$m4[,.(m4=rps)])
+
+
+setnames(boot_data,"rps","bench")
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "rps improvement over bench [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+```
+
+here is the skill scores at every smart meter
+
+- still lots of variation by node, but you can see general positive skill score in CV at least
+- testing is more marginal, as seen above
+
+
+```{r fig.height=50,fig.width=15}
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("id","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+
+boot_dt[model_id=="m4",ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "rps improvement over bench [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+```
+
+
+Here are example forecasts at a sample of smart meters
+
+- each page shows predictions from the 5 different models
+
+
+```{r fig.height= 7.5, animation.hook="gifski", interval = 0.5, results = "hide", warning = F}
+
+## generate MQR objects
+model_ids <- names(sm_models)
+sm_models <- lapply(model_ids,function(x){
+  
+  loc_ids <- names(sm_models[[x]])
+  
+  sm_models[[x]] <- lapply(loc_ids,function(y){
+  
+  
+  sm_models[[x]][[y]]$mqr_pred <- data.frame(t(apply(sm_models[[x]][[y]]$prob_pred,1,function(z){
+    
+    approxfun(x = c(0,z[1:(length(z)-1)]),y = 1:48,method = "constant",rule = 2)(c(0.01,seq(0.05,0.95,0.05),.99))
+    
+  })))
+  
+  colnames(sm_models[[x]][[y]]$mqr_pred) <- paste0("q",c(0.01,seq(0.05,0.95,0.05),.99)*100)
+  class(sm_models[[x]][[y]]$mqr_pred) <- c("MultiQR",class(sm_models[[x]][[y]]$mqr_pred))
+  
+  return(sm_models[[x]][[y]])
+  })
+  
+  names(sm_models[[x]]) <- loc_ids
+  
+  return(sm_models[[x]])
+  
+  
+})
+
+names(sm_models) <- model_ids
+  
+  
+
+
+
+set.seed(1)
+smp_ids <- lcl_data[peak_ind==1 & aggregation=="sm",sample(unique(id),10)]
+
+for(j in names(sm_models)){
+  par(mfrow=c(5,2))
+  for(i in smp_ids){
+    
+    plot(sm_models[[j]][[i]]$mqr_pred,q50_line = TRUE,main=paste0(i," --- ",j),
+         cols = colorRampPalette(c("gold", "red")),ylim=c(0,50))
+    lines(pamm_data[id==i & peak==1,time_ind],type = "s")
+    abline(h=48,lty=2,col="red")
+    
+    
+  }
+}
+
+
+```
+
+- we can see that the calibration of `m4` and is much improved compared to the benchmark, particularly at a few stranger nodes
+
+```{r}
+
+
+
+##### evaluate using rps - takes a while so save and load - takes ~1.5hrs
+l_file <- TRUE
+if(file.exists(paste0(data_save,"timing_evalrel_sm.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"timing_evalrel_sm.rda"))
+} else{
+  
+  # time-of-day and day of year interaction - takes a bit of time
+  t1 <- proc.time()
+  eval_sm_rel <- lapply(names(sm_models), function(x){
+    
+    xtr_fc <- lapply(sm_models[[x]],function(z){z$mqr_pred})
+    names(xtr_fc) <- names(sm_models[[x]])
+    
+    
+    rps <- rbindlist(ml_eval_cat(fc_list = xtr_fc,
+                                 metric = "mcrd",
+                                 melted_dt = pamm_data[aggregation=="sm" & peak==1],
+                                 obs_col = "time_ind",
+                                 split_col = "id",
+                                 mcrd_sort = "aggregation",
+                                 mcrd_kfoldall = TRUE,
+                                 nboot = 100,
+                                 sort_cols = c("date_uk","aggregation")),idcol = "id")
+    
+    return(rps)
+    
+    
+  })
+  print(proc.time()-t1)
+  
+  names(eval_sm_rel) <- names(sm_models)
+  
+  
+  save(eval_sm_rel,file = paste0(data_save,"timing_evalrel_sm.rda"))
+  
+}
+
+
+
+
+
+temprel <- rbindlist(eval_sm_rel,idcol = "model")
+
+ggplot(data=temprel[model%in%c("bench","m4")],aes(x=Nominal)) +
+  labs(y = "empirical coverage [-]", x = "nominal coverage [-]") +
+  geom_line(aes(y = Empirical,group =  id,colour = model),alpha=.4) +
+  geom_point(aes(y = Empirical, group =  id,colour=model), size = 1) +
+  # geom_errorbar(aes(ymin=lower,ymax=upper,group=id))+
+  geom_line(aes(y=Nominal),colour = "black", linetype = "dashed") +
+  facet_grid(aggregation~kfold+model) +
+  theme(legend.position="top")+guides(colour = guide_legend(nrow = 1))
+
+```
+
+
+
+
+<!-- - revise concepts of tte analysis -->
+<!-- - file:///C:/Users/Ciaran/Downloads/1-s2.0-S0306261921011326-main.pdf -->
+<!-- - bruce's papers  -->
+<!--   https://www.sciencedirect.com/science/article/pii/S0378779620305356?via%3Dihub  -->
+<!--   https://ieeexplore.ieee.org/document/9250693 -->
+<!-- - 48hr forecasts -->
+
+
+
+
+
+<!-- - manually adjust penalisation -->
+<!-- - global model, one model? -->
+<!-- - multivriate skill scores? -->
+
+
+
+
+# Session info
+
+
+```{r}
+
+
+s_file <- FALSE
+if(s_file | !file.exists(paste0(data_save,"timing_smfc_outv2.rda"))){
+save(agg_models,eval_agg,eval_agg_rel,
+     sm_models,eval_sm,eval_sm_rel,file = paste0(data_save,"timing_smfc_outv2.rda"),compress = "xz")
+}
+
+
+
+```
+
+
+
+
+```{r}
+
+sessionInfo()
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

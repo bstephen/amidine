@@ -1,0 +1,2335 @@
+---
+title: "Amidine --- Day ahead half-hourly Forecasting"
+author: "Ciaran Gilbert"
+date: "`r format(Sys.Date(),'%d-%m-%Y')`"
+output:
+  html_document:
+    code_folding: show
+    theme: united
+    number_sections: true
+    toc: true
+---
+
+<style>
+.main-container {
+    max-width: 1200px !important;
+}
+pre {
+  overflow-x: auto;
+}
+pre code {
+  word-wrap: normal;
+  white-space: pre;
+}
+</style>
+
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 800)
+```
+
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(
+ fig.width=15,fig.height=5,fig.align="center"
+)
+```
+
+
+First some required packages and functions for plotting/importing data
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+# options(repos='http://cran.rstudio.com/') ##restart?
+
+packages <- c("rmarkdown","cli","data.table","ggplot2","mgcv",
+              "gifski")
+
+install.packages(setdiff(packages, rownames(installed.packages())))
+
+rm(list=ls())
+
+library(data.table)
+library(ggplot2)
+library(ProbCast)
+
+data_imp_loc <- "../../data/"
+data_save <- "../../saved_data/"
+
+# include utility functions
+source("../amidine_utils/amidine_utils.R")
+
+ncores <- parallel::detectCores()
+
+
+### note in my ~/home/.Rprofile file I have configured R so it can use some paged memory for the big data processing
+### invisible(utils::memory.limit(64000))
+
+
+```
+
+Now let's load the data from the data exploration and preparation document
+
+
+```{r}
+
+load(paste0(data_save,"prep_expl_smfc_outv2.rda"))
+
+hier_ref
+
+
+```
+
+Here is the daily consumption at the highest aggregation over the course of the dataset
+
+```{r}
+
+
+
+
+
+group.colors <- c(mean = "steelblue", each_day =alpha("grey50",0.2))
+
+ggplot(data=lcl_data[aggregation=="ps"],aes(x=tod_uk,y=demand))+
+  labs(y = "demand [kWh]", x = "tod uk [h]")+
+  geom_line(aes(group=date_uk,colour="each_day"))+
+  geom_line(aes(x = tod_uk, y= demand, colour = "mean"),
+            data = lcl_data[aggregation=="ps",.(demand=mean(demand)),by=.(id,tod_uk)],size=1.2)+
+  facet_grid(~id,scales = "free_y")+
+  theme(legend.position="top")+scale_colour_manual(values=group.colors)+
+  guides(colour=guide_legend(title="series"))
+
+
+
+
+```
+
+Now at the secondary substation level
+
+```{r}
+
+
+ggplot(data=lcl_data[aggregation=="ss"],aes(x=tod_uk,y=demand))+
+  labs(y = "demand [kWh]", x = "tod uk [h]")+
+  geom_line(aes(group=date_uk,colour="each_day"))+
+  geom_line(aes(x = tod_uk, y= demand, colour = "mean"),
+            data = lcl_data[aggregation=="ss",.(demand=mean(demand)),by=.(id,tod_uk)],size=1.2)+
+  facet_grid(~id,scales = "free_y")+
+  theme(legend.position="top")+scale_colour_manual(values=group.colors)+
+  guides(colour=guide_legend(title="series"))
+
+
+
+
+```
+
+Now at the feeder level 
+
+- note the rows indicate which secondary substation the feeder belongs to
+
+```{r}
+
+
+
+
+group.colors <- c(mean = "steelblue", each_day =alpha("grey50",0.2))
+
+ggplot(data=lcl_data[aggregation=="fdr"],aes(x=tod_uk,y=demand))+
+  labs(y = "demand [kWh]", x = "tod uk [h]")+
+  geom_line(aes(group=date_uk,colour="each_day"))+
+  geom_line(aes(x = tod_uk, y= demand, colour = "mean"),
+            data = lcl_data[aggregation=="fdr",.(demand=mean(demand)),by=.(ss_id,fdr_id,tod_uk)],size=1.2)+
+  facet_grid(ss_id~fdr_id,scales = "free_y")+
+  theme(legend.position="top")+scale_colour_manual(values=group.colors)+
+  guides(colour=guide_legend(title="series"))
+
+
+
+
+```
+
+
+
+
+
+# Feature engineering
+
+Here we engineer features we will use in the regression tasks
+
+- we generate simple lags of demand from 1 day and 7 days previous
+    - note that these lags will be off on the clock hour change days, but not a big deal in grand scheme of things
+- the clock hour factors are based on local time in london
+- we engineer a feature which is yesterdays peak value, this is the same for all half hours in a day
+- we also process the exact zero measurements to be approximately zero (only 800 data points out of 13M)
+    - we can also recover the zeros at these smart meters
+- note we could do a lot more feature engineering here probably: last known value, rolling variance etc.
+    - keep for future work
+
+Here are the lag dependency plots
+
+
+```{r ,message=FALSE,warning=FALSE,results='hide'}
+
+## lagged values
+lcl_data[,demand_l1d:=shift(demand,n=48L),by=.(id)]
+lcl_data[,demand_l7d:=shift(demand,n=48*7),by=.(id)]
+
+
+lcl_data[,dow_ftr:="weekday"]
+lcl_data[dow_uk==1,dow_ftr:="sunday"]
+lcl_data[dow_uk==7,dow_ftr:="saturday"]
+lcl_data[,dow_ftr:=factor(dow_ftr)]
+
+
+min_d <- lcl_data[demand!=0,min(demand)]
+lcl_data[demand==0,demand:=min_d/10]
+
+
+
+lcl_data[,tod_ftr:=factor(paste0("tod_",tod_uk))]
+lcl_data[,toddow_ftr:=factor(paste0("tod_",tod_uk,"_",as.character(dow_ftr)))]
+
+
+lcl_data[,dow_uk:=factor(dow_uk)]
+lcl_data[,moy_uk:=factor(moy_uk)]
+
+
+
+## lagged peak
+lcl_data[peak_ind==1,demandpk_l1d:=shift(demand,n=1L),by=.(id)]
+lcl_data[peak_ind==1,demandpk_l7d:=shift(demand,n=7L),by=.(id)]
+
+
+lcl_data[,demandpk_l1d:=nafill(nafill(demandpk_l1d,type = "locf",nan = NA),
+                              type = "nocb",nan = NA),by=.(id,date_uk)]
+lcl_data[,demandpk_l7d:=nafill(nafill(demandpk_l7d,type = "locf",nan = NA),
+                              type = "nocb",nan = NA),by=.(id,date_uk)]
+
+## lagged rolling variance?
+
+
+lcl_data <- na.omit(lcl_data)
+
+
+
+ggplot(data=lcl_data[aggregation!="sm"],aes(y=demand,x=demand_l1d))+
+  labs(y = "demand [kWh]",x = "demand lag 1d [kWh]")+
+  geom_point(size=0.1,colour="steelblue",alpha=.5)+
+  facet_wrap(~aggregation,nrow=1,scales = "free")
+
+
+
+
+
+```
+
+
+
+<!-- ```{r} -->
+
+
+<!-- ggplot(data=lcl_data[aggregation!="sm"],aes(y=demand,x=demandpk_l1d))+ -->
+<!--   labs(y = "demand [kWh]",x = "demand lag 1d [kWh]")+ -->
+<!--   geom_point(size=0.1,colour="steelblue",alpha=.5)+ -->
+<!--   facet_wrap(~aggregation,nrow=1,scales = "free") -->
+
+
+
+
+
+<!-- ``` -->
+
+
+The task at hand here is to predict the energy demand at the day-ahead horizon
+
+Let's just dive into doing some forecasting, we will start by chopping the data into 3 folds. We have 2 folds for cross validation and one for testing, obviously we don't have a very big dataset for estimation and evaluation. Therefore quantifying the uncertainty in evaluation metrics will be key.
+
+- we will divide each month into three fold chunks and take them as our folds, using the third chunk as our blind testing data
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+lcl_data[,kfold:=paste0("fold",ceiling(as.integer(format(date_uk,"%d"))/10))]
+lcl_data[kfold=="fold4",kfold:="fold1"]
+lcl_data[kfold=="fold3",kfold:="Test"]
+
+
+```
+
+
+Here is the average demand at the primary substation level the day of week type feature
+
+- you can see sunday is the high demand day at this aggregation since we are focused on residential demand (:
+
+
+```{r}
+
+
+
+
+ggplot(data=lcl_data[aggregation=="ps",.(demand=mean(demand)),by=.(id,tod_uk,dow_ftr)],
+       aes(x=tod_uk,y=demand,colour=dow_ftr))+
+  labs(y = "demand [kWh]", x = "tod uk [h]")+
+  geom_line()+
+  facet_grid(~id,scales = "free_y")+
+  theme(legend.position="top")+
+  guides(colour=guide_legend(title="series"))
+
+
+```
+
+# Aggregate levels
+
+Ok now we will train the forecasting models at the aggregate levels, just like the peak forecasting task we will use **gamlss** for the regression and use linear, penalised splines, factors, varying coefficient, and cyclical splines for our features. We will use gaussian family here for the conditional dist of the response
+
+Here are some notes of things and tests that didn't work during experimentation
+
+- more flexible splines and a factor for day-of-year effect
+- tried varying coef model for every day of week, takes too long to fit
+- student-t conditional dist. didn't help
+- GB2 distribution leads to overconfident forecasts in the PIT, even with heavily penalised effects which were sometimes failing to fit :s - try boosting?
+- the autoregressive term for the sigma values, hmm not too sure about them - definitely reduce the skill during the peak as well, see `m8` performance later
+- These two statements are the correct way round but intuitively they were meant to effect the opposite way round lol
+    - the peak interaction terms really improve the skill during all hours
+    - the autoregressive interaction term helps during the peaks
+    
+And here are some things that would possibly improve the forecasts
+
+- holiday features, temperature etc....
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+agg_models <- list()
+
+agg_models$bench <- ml_pc_gamlss(melted_dt = lcl_data[aggregation!="sm"],
+                                 vars = c("demand","demand_l1d","demand_l7d","tod_uk"),
+                                 split_col = "id",
+                                 sort_cols = "date_time",
+                                 ncores = ncores,
+                                 ncores_inner = 1,
+                                 formula = demand~demand_l1d+demand_l7d+pb(tod_uk),
+                                 sigma.formula = ~pb(tod_uk),
+                                 family = NO,
+                                 dt_tempdir = "C:/Users/Ciaran/Desktop/")
+
+agg_models$m1 <- ml_pc_gamlss(melted_dt = lcl_data[aggregation!="sm"],
+                              vars = c("demand","demand_l1d","demand_l7d","tod_uk"),
+                              split_col = "id",
+                              sort_cols = "date_time",
+                              ncores = ncores,
+                              ncores_inner = 1,
+                              formula = demand~demand_l1d+demand_l7d+pb(tod_uk),
+                              sigma.formula = ~demand_l1d+demand_l7d+pb(tod_uk),
+                              family = NO,
+                              dt_tempdir = "C:/Users/Ciaran/Desktop/")
+
+
+agg_models$m2 <- ml_pc_gamlss(melted_dt = lcl_data[aggregation!="sm"],
+                              vars = c("demand","demand_l1d","demand_l7d","tod_uk","dow_uk"),
+                              split_col = "id",
+                              sort_cols = "date_time",
+                              ncores = ncores,
+                              ncores_inner = 1,
+                              formula = demand~demand_l1d+demand_l7d+pb(tod_uk)+dow_uk,
+                              sigma.formula = ~demand_l1d+demand_l7d+pb(tod_uk),
+                              family = NO,
+                              dt_tempdir = "C:/Users/Ciaran/Desktop/")
+
+agg_models$m3 <- ml_pc_gamlss(melted_dt = lcl_data[aggregation!="sm"],
+                              vars = c("demand","demand_l1d","demand_l7d","tod_uk","doy_uk","dow_uk"),
+                              split_col = "id",
+                              sort_cols = "date_time",
+                              ncores = ncores,
+                              ncores_inner = 1,
+                              formula = demand~demand_l1d+demand_l7d+pb(tod_uk)+dow_uk+
+                                pb(doy_uk,control = pb.control(inter = 12),df=4),
+                              sigma.formula = ~demand_l1d+demand_l7d+pb(tod_uk),
+                              family = NO,
+                              dt_tempdir = "C:/Users/Ciaran/Desktop/")
+
+t1 <- proc.time()
+agg_models$m4 <- ml_pc_gamlss(melted_dt = lcl_data[aggregation!="sm"],
+                              vars = c("demand","demand_l1d","demand_l7d","tod_uk","dow_uk","doy_uk"),
+                              split_col = "id",
+                              sort_cols = "date_time",
+                              ncores = ncores,
+                              ncores_inner = 1,
+                              formula = demand~demand_l1d+demand_l7d+pb(tod_uk)+dow_uk+
+                                pbc(doy_uk,control = pbc.control(inter = 12),df=4),
+                              sigma.formula = ~demand_l1d+demand_l7d+pb(tod_uk),
+                              family = NO,
+                              dt_tempdir = "C:/Users/Ciaran/Desktop/")
+print(proc.time()-t1)
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_agg_m5.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_agg_m5.rda"))
+} else{
+  
+  
+  # takes about 45 mins...
+  t1 <- proc.time()
+  agg_model <- ml_pc_gamlss(melted_dt = lcl_data[aggregation!="sm"],
+                            vars = c("demand","demand_l1d","demand_l7d","tod_uk","dow_ftr","doy_uk"),
+                            split_col = "id",
+                            sort_cols = "date_time",
+                            ncores = ncores,
+                            ncores_inner = 1,
+                            formula = demand~demand_l1d+demand_l7d+pvc(tod_uk,by=dow_ftr)+
+                              pbc(doy_uk,control = pbc.control(inter = 12),df=4),
+                            sigma.formula = ~demand_l1d+demand_l7d+pb(tod_uk),
+                            family = NO,
+                            dt_tempdir = "C:/Users/Ciaran/Desktop/")
+  print(proc.time()-t1)
+  
+  save(agg_model,file = paste0(data_save,"halfhourly_agg_m5.rda"))
+  
+}
+
+
+
+agg_models$m5 <- agg_model
+rm(agg_model)
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_agg_m6.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_agg_m6.rda"))
+} else{
+  
+  
+  # takes about 45 mins...
+  t1 <- proc.time()
+  agg_model <- ml_pc_gamlss(melted_dt = lcl_data[aggregation!="sm"],
+                            vars = c("demand","demand_l1d","demand_l7d","tod_uk",
+                                     "dow_ftr","doy_uk","demandpk_l1d","tod_ftr"),
+                            split_col = "id",
+                            sort_cols = "date_time",
+                            ncores = ncores,
+                            ncores_inner = 1,
+                            formula = demand~demand_l1d+demand_l7d+pvc(tod_uk,by=dow_ftr)+
+                              demandpk_l1d + demandpk_l1d:tod_ftr +
+                              pbc(doy_uk,control = pbc.control(inter = 12),df=4),
+                            sigma.formula = ~demand_l1d+demand_l7d+pb(tod_uk),
+                            family = NO,
+                            dt_tempdir = "C:/Users/Ciaran/Desktop/")
+  print(proc.time()-t1)
+  
+  save(agg_model,file = paste0(data_save,"halfhourly_agg_m6.rda"))
+  
+}
+
+
+
+agg_models$m6 <- agg_model
+rm(agg_model)
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_agg_m7.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_agg_m7.rda"))
+} else{
+  
+  
+  # takes about 45 mins...
+  t1 <- proc.time()
+  agg_model <- ml_pc_gamlss(melted_dt = lcl_data[aggregation!="sm"],
+                            vars = c("demand","demand_l1d","demand_l7d","tod_uk",
+                                     "dow_ftr","doy_uk","demandpk_l1d","tod_ftr"),
+                            split_col = "id",
+                            sort_cols = "date_time",
+                            ncores = ncores,
+                            ncores_inner = 1,
+                            formula = demand~demand_l1d+demand_l7d+pvc(tod_uk,by=dow_ftr)+
+                              demand_l1d:tod_ftr + demandpk_l1d + demandpk_l1d:tod_ftr +
+                              pbc(doy_uk,control = pbc.control(inter = 12),df=4),
+                            sigma.formula = ~demand_l1d+demand_l7d+pb(tod_uk),
+                            family = NO,
+                            dt_tempdir = "C:/Users/Ciaran/Desktop/")
+  print(proc.time()-t1)
+  
+  save(agg_model,file = paste0(data_save,"halfhourly_agg_m7.rda"))
+  
+}
+
+
+
+agg_models$m7 <- agg_model
+rm(agg_model)
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_agg_m8.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_agg_m8.rda"))
+} else{
+  
+  
+  # takes about 45 mins...
+  t1 <- proc.time()
+  agg_model <- ml_pc_gamlss(melted_dt = lcl_data[aggregation!="sm"],
+                            vars = c("demand","demand_l1d","demand_l7d","tod_uk",
+                                     "dow_ftr","doy_uk","demandpk_l1d","tod_ftr"),
+                            split_col = "id",
+                            sort_cols = "date_time",
+                            ncores = ncores,
+                            ncores_inner = 1,
+                            formula = demand~demand_l1d+demand_l7d+pvc(tod_uk,by=dow_ftr)+
+                              demand_l1d:tod_ftr + demandpk_l1d + demandpk_l1d:tod_ftr +
+                              pbc(doy_uk,control = pbc.control(inter = 12),df=4),
+                            sigma.formula = ~pb(tod_uk),
+                            family = NO,
+                            dt_tempdir = "C:/Users/Ciaran/Desktop/")
+  print(proc.time()-t1)
+  save(agg_model,file = paste0(data_save,"halfhourly_agg_m8.rda"))
+  
+}
+
+
+
+agg_models$m8 <- agg_model
+rm(agg_model)
+
+
+```
+
+
+The formula for the location and scale parameters for the conditional gaussian models are shown below.
+
+```{r}
+
+cat("mu~\n")
+lapply(agg_models,function(x){x[[1]]$Test$mu.formula})
+cat("sigma~\n")
+lapply(agg_models,function(x){x[[1]]$Test$sigma.formula})
+
+
+
+```
+
+
+Let's have a look at the `bench` model term plots, which show the effect of the regression terms on the outcome for each feature. Here is the term plots for `ss2_fdr_3`
+
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+# set.seed(1)
+# sample_ids <- pklcl_data[aggregation!="sm",sample(unique(id),3)]
+sample_ids <- c("ss2_fdr3")
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+for(i in sample_ids){
+tempdata <- lcl_data[id==i & kfold!="Test"]
+# this is a gamlss/probcast quirk
+fold <- "Test"
+term.plot(agg_models$bench[[i]]$Test,what = "mu",rug = TRUE,ask = FALSE,
+          data = tempdata, ylim = "free",main=i,cex.lab=.9,pages = 1)
+}
+
+```
+
+
+Let's have a look at the `m5` model term plots for `ss2_fdr_3`
+
+- as you can see there are two features different for the location parameter, the smooth cyclical day of year effect and the varying coefficient splines for time of day by weekday type
+- the `var.coef` feature captures the weekday, saturday, and sunday profiles very well
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+for(i in sample_ids){
+tempdata <- lcl_data[id==i & kfold!="Test"]
+# this is a gamlss/probcast quirk
+fold <- "Test"
+term.plot(agg_models$m5[[i]]$Test,what = "mu",
+          rug = TRUE,ask = FALSE,data = tempdata,
+          ylim = "free",main=i,cex.lab=.9,pages = 1)
+}
+
+
+```
+
+
+Let's have a look at the `m8` model term plots for `ss2_fdr_3`
+
+- the `var.coef` feature here captures the difference from the average effect for the three day types
+- this is because of the linear interaction terms that are included in the model formula as well between the lagged peak value and the time of day factor 
+
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+for(i in sample_ids){
+tempdata <- lcl_data[id==i & kfold!="Test"]
+# this is a gamlss/probcast quirk
+fold <- "Test"
+term.plot(agg_models$m8[[i]]$Test,what = "mu",
+          rug = TRUE,ask = FALSE,data = tempdata,
+          ylim = "free",main=i,cex.lab=.9,pages = 1)
+}
+
+
+```
+
+Let's have a look at the `m8` model term plots for `ss2_fdr_3` for the sigma parameter
+
+- the penalised spline shows captures the reduced uncertainty overnight along with the increase in uncertainty during the morning pick-up and the evening peak
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+for(i in sample_ids){
+tempdata <- lcl_data[id==i & kfold!="Test"]
+# this is a gamlss/probcast quirk
+fold <- "Test"
+term.plot(agg_models$m8[[i]]$Test,what = "sigma",
+          rug = TRUE,ask = FALSE,data = tempdata,
+          ylim = "free",main=i,cex.lab=.9,pages = 1)
+}
+
+
+```
+
+
+Now convert the models so they take up less memory
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+
+### reduce memory footprint now we have an idea of model fits.
+agg_models <- lapply(agg_models,function(x){
+  
+  
+  ml_ppd2ppd_lite(ppd_list = x,
+                  melted_dt = lcl_data[aggregation!="sm"],
+                  split_col = "id",
+                  sort_cols = "date_time")
+  
+  
+  
+})
+invisible(gc())
+
+
+print(":)")
+
+```
+
+
+
+
+Now to evaluate the predictions using CRPS. We will also use bootstrapping to calculate the average improvement over the `bench` model at the different levels of aggregation.
+
+You can see the skill of the forecasts steadily increasing as the model becomes slightly more complex generally.
+
+- Clearly there is a significant jump in skill between the `m5` and `m4` model, which shows the benefit in the varying coefficient splines.
+- There is also a significant jump between the `m5` and `m6` model which shows how important the yesterday's peak effect is, as well as it's interaction term with time of day
+- the `m7` model arguably improves the skill in CV but not so much in testing
+- the `m8` model shows a slight reduction in skill compared to `m7` but performs well during the daily peaks as will be shown later
+- Generally, the skill score magnitudes reduce as you go down the voltage levels as demand befomes less smooth and more difficult to predict
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+t1 <- proc.time()
+# Initiate cluster
+cl <- makeCluster(pmin(length(agg_models),ncores))
+registerDoSNOW(cl)
+#set up progress bar
+iterations <- length(agg_models)
+pb <- txtProgressBar(max = iterations, style = 3)
+progress <- function(n) setTxtProgressBar(pb, n)
+opts <- list(progress = progress)
+
+# evaluate each model id - takes about 300s
+eval_agg <- foreach(x = names(agg_models),.packages = c("data.table"),.options.snow = opts) %dopar% {
+  
+  crps <- rbindlist(ml_crps_mods(mod_list = agg_models[[x]],
+                                 melted_dt = lcl_data[aggregation!="sm"],
+                                 sort_cols = c("aggregation","date_time"),
+                                 quantiles = seq(0.01,0.99,0.01)),idcol = "id")
+  
+  crps[kfold!="Test",kfold:="All_cv"]
+  
+  return(crps)
+  
+}
+print(proc.time()-t1)
+
+names(eval_agg) <- names(agg_models)
+        
+close(pb)
+stopCluster(cl)
+rm(cl,iterations,progress,opts,pb)
+
+
+
+
+boot_data <- cbind(eval_agg$bench,
+                   eval_agg$m1[,.(m1=crps)],
+                   eval_agg$m2[,.(m2=crps)],
+                   eval_agg$m3[,.(m3=crps)],
+                   eval_agg$m4[,.(m4=crps)],
+                   eval_agg$m5[,.(m5=crps)],
+                   eval_agg$m6[,.(m6=crps)],
+                   eval_agg$m7[,.(m7=crps)],
+                   eval_agg$m8[,.(m8=crps)])
+
+setnames(boot_data,"crps","bench")
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) 
+        +labs(y = "crps improvement over bench [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+```
+
+
+
+
+Here is the skill scores of `m8` against the `bench` model at the different nodes. You can see significant improvement at all aggregate locations of the network, but particularly so at the higher aggregations.
+
+The testing performance skill sores are definitely worse than the cross validation set, checked for over-fitting though and not clearly from this
+
+
+```{r fig.height = 7.5}
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","id","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+
+boot_dt[model_id=="m8",ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement over bench [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(aggregation~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+Here is the average CRPS values for the different times of day.
+
+- you can really see the marked improvement between `m5` and `m6` during the morning pick up (:
+- `m8` and really improves things during the evening peak
+
+```{r}
+
+boot_dt <-melt(boot_data,id.vars = c("id","aggregation","date_time","kfold"))
+boot_dt[,tod_uk:= hour(date_time)]
+
+
+ggplot(data=boot_dt[!c(variable%in%c("m2","m3","m7")),
+                    .(crps=mean(value)),keyby=.(aggregation,kfold,variable,tod_uk)],
+       aes(x=tod_uk,y=crps,colour=variable))+
+  labs(y = "crps [kWh]", x = "tod uk [h]")+
+  geom_line()+
+  facet_grid(aggregation~kfold,scales = "free_y")+
+  theme(legend.position="top")+
+  guides(colour=guide_legend(title="forecast",nrow = 1,title.position = "top"))
+
+
+```
+
+
+Here is the skill scores calculated only during the daily peaks
+
+- you can really see the marked improvement in the last three models here, especiallly `m8`
+
+```{r}
+
+
+
+boot_data <- boot_data[lcl_data[aggregation!="sm",.(id,date_time,peak_ind)],on=.(id,date_time)]
+boot_data <- boot_data[peak_ind==1]
+boot_data[,peak_ind:=NULL]
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) 
+        +labs(y = "crps improvement over bench [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold, scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+```
+
+
+Here are example forecasts for four locations over the course of a week for the bench model
+
+
+```{r animation.hook="gifski", interval = 0.5}
+
+
+
+# sample_ids <- c("ps1","ss4","ss2_fdr3")
+set.seed(2)
+sample_ids <- sort(lcl_data[aggregation!="sm",sample(unique(id),4)])
+date_oi  <- lcl_data[,sample(unique(date_uk),1)]
+date_oi <- date_oi+1:7*60*60*24
+
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+# mqr_tmp <-  as.MultiQR.ppd_lite(agg_models$bench[[i]])
+  
+for(j in seq_along(date_oi)){
+  par(mfrow=c(2,2))
+  for(i in sample_ids){
+    
+    
+    inds <- lcl_data[id==i][date_uk==date_oi[j],which=T]
+    mqr_tmp <-  as.MultiQR.ppd_lite(agg_models$bench[[i]],
+                                    quantiles = seq(0.01,0.99,0.01),
+                                    index = inds)
+    # 
+    plot(mqr_tmp,q50_line = TRUE,
+         main=paste0(i," --- bench --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")))
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+  }
+  
+  
+  
+}
+
+
+
+```
+
+Now the same for `m8` - nice!
+
+```{r animation.hook="gifski", interval = 0.5}
+
+
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+# mqr_tmp <-  as.MultiQR.ppd_lite(agg_models$bench[[i]])
+  
+for(j in seq_along(date_oi)){
+  par(mfrow=c(2,2))
+  for(i in sample_ids){
+    
+    
+    inds <- lcl_data[id==i][date_uk==date_oi[j],which=T]
+    mqr_tmp <-  as.MultiQR.ppd_lite(agg_models$m8[[i]],
+                                    quantiles = seq(0.01,0.99,0.01),
+                                    index = inds)
+    # 
+    plot(mqr_tmp,q50_line = TRUE,
+         main=paste0(i," --- m8 --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")))
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+  }
+  
+  
+  
+}
+
+
+
+```
+
+
+Here are the PIT histograms, which should be uniform
+
+- calibration looks good at the `ps` and `ss` levels, with some mis-calibration at the upper end of the distribution
+- calibration of the feeder level could be better :/
+
+```{r fig.height=5}
+
+
+agg_eval_pit <- lapply(names(agg_models),function(x){
+  
+  rbindlist(lapply(names(agg_models[[x]]),function(y){
+    
+  
+    pit_out <- lcl_data[id==y,.(id,aggregation,date_time,kfold,demand)]
+    pit_out[,pit := PIT(agg_models[[x]][[y]],obs = demand)]
+    pit_out[,demand:=NULL]
+    pit_out[kfold!="Test",kfold:="All_cv"]
+
+  }))
+  
+  
+})
+names(agg_eval_pit) <- names(agg_models)
+
+agg_eval_pit <- rbindlist(agg_eval_pit,idcol = "model_id")
+
+
+
+
+ggplot(data=agg_eval_pit[model_id%in%c("bench","m5","m8")], aes(x=pit)) +
+  labs(y = "density [-]", x = " probability level") +
+  geom_histogram(aes(y = stat(density)),closed = "left", fill = "grey75",
+                 color = "white", boundary=1, bins=20)+
+  geom_hline(aes(yintercept = 1,colour = "ideal"), linetype = "dashed")+
+  facet_grid(aggregation~kfold+model_id,scales = "free_y")+
+  theme(legend.position="top")
+
+
+```
+
+
+
+Lastly we will check the prediction calibration via reliability diagrams. As you can see over both the cross validation and testing datasets both forecasts are well calibrated, with the `m5` and `m8` models marginally better
+
+```{r fig.height=7.5,message=FALSE,warning=FALSE,results='hide'}
+
+
+eval_agg_rel <- lapply(names(agg_models), function(x){
+  
+  
+  crps <- rbindlist(ml_eval_mods(mod_list = agg_models[[x]],
+                                 metric = "rel",
+                                 melted_dt = lcl_data[aggregation!="sm"],
+                                 obs_col = "demand",
+                                 split_col = "id",
+                                 plot.it=FALSE,
+                                 sort_cols = c("aggregation","date_time"),
+                                 quantiles = seq(0.01,0.99,0.01)),idcol = "id")
+  
+
+  
+})
+
+names(eval_agg_rel) <- names(agg_models)
+
+
+
+
+temprel <- rbindlist(eval_agg_rel,idcol = "model")
+temp <- unique(lcl_data[,.(id,aggregation)])
+temprel <- temprel[temp,on=.(id)]
+
+ggplot(data=temprel[model%in%c("bench","m5","m8") & kfold%in%c("All_cv","Test")],aes(x=Nominal)) +
+  labs(y = "empirical coverage [-]", x = "nominal coverage [-]") +
+  geom_line(aes(y = Empirical,group =  id,colour=model)) +
+  # geom_point(aes(y = Empirical, group =  id),colour="steelblue", size = 1,alpha=.1) +
+  geom_line(aes(y=Nominal),colour = "black", linetype = "dashed") +
+  facet_grid(aggregation~kfold+model) +
+  theme(legend.position="top")+
+  guides(colour=guide_legend(title="forecast",nrow = 1,title.position = "top"))
+
+
+
+```
+
+
+
+```{r}
+
+
+rm(tempdata,temprel,temp,mqr_tmp,boot_data,boot_dt,agg_eval_pit)
+invisible(gc())
+
+```
+
+
+
+# Household level
+
+Here we will generate the day ahead forecasts at the houshold level
+
+## Sub-sample
+
+To begin we will use a sub-sample of smart meters attached to `ss5` and `fdr1`. This will allow us to experiment without the need of fitting/evaluating 750 models each time.
+
+Here are the daily profiles. As you can see there is a great diversity of behaviours! 
+
+
+```{r fig.height = 7.5}
+# smp_ids <- c(lcl_data[aggregation=="sm" & ss_id=="ss4",sample(unique(id),5)],"N0894")
+
+
+sm_ids <- hier_ref[ss_id=="ss5" & fdr_id=="fdr1",id]
+group.colors <- c(mean = "steelblue", each_day =alpha("grey50",0.2))
+
+ggplot(data=lcl_data[id%in%sm_ids],aes(x=tod_uk,y=demand))+
+  labs(y = "demand [kWh]", x = "tod uk [h]")+
+  geom_line(aes(group=date_uk,colour="each_day"))+
+  geom_line(aes(x = tod_uk, y= demand, colour = "mean"),
+            data = lcl_data[id%in%sm_ids,.(demand=mean(demand)),by=.(id,tod_uk)],size=1.2)+
+  facet_wrap(~id,nrow=5,scales = "free_y")+
+  theme(legend.position="top")+scale_colour_manual(values=group.colors)+
+  guides(colour=guide_legend(title="series",nrow = 1,title.position = "top"))
+
+
+```
+
+
+Ok now we will train the forecasting models at the housholds. We will use **gamlss** for the regression and use linear, penalised splines, factors, varying coefficient, and cyclical splines for our features. This time we will use the **generalised beta prime distribution** for the conditional response. This is a flexible 4 parameter distribution which allows us to capture skewness in the response.
+
+
+Here are some notes/comments of things during experimentation
+
+- the truncated gaussian was failing at some nodes, I think because the location parameter was getting to approximately zero at some smart meters which was causing NAs in the truncated normal density
+- we could use censored gaussian but that is a pain and requires the response to be in a interval format like survival analysis
+- lags overfitting in the sigma term, just keep it simple for there
+- we need both the lags and time of day in the location model to be skilful 
+- tried similar interaction terms to aggregate models but didn't really have an effect at this level..during peak not much effect either
+
+
+And here are some things that would possibly improve the forecasts
+
+- empty house feature? holidays etc?
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_sm_subsamp.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_sm_subsamp.rda"))
+} else{
+  
+  sm_models <- list()
+  
+  #bout 800s
+  t1 <- proc.time()
+  sm_models$m1 <- ml_pc_gamlss(melted_dt = lcl_data[id%in%sm_ids],
+                               vars = c("demand","tod_uk"),
+                               split_col = "id",
+                               sort_cols = "date_time",
+                               ncores = ncores,
+                               ncores_inner = 1,
+                               parallel_inner = FALSE,
+                               formula = demand ~ pb(tod_uk),
+                               sigma.formula = ~ pb(tod_uk),
+                               family = GB2,
+                               dt_tempdir = "C:/Users/Ciaran/Desktop/",
+                               lite=TRUE)
+  print(proc.time()-t1)
+  
+  
+  
+  # takes about 850s for 20sms
+  t1 <- proc.time()
+  sm_models$m2 <- ml_pc_gamlss(melted_dt = lcl_data[id%in%sm_ids],
+                               vars = c("demand","demand_l1d","demand_l7d","tod_uk"),
+                               split_col = "id",
+                               sort_cols = "date_time",
+                               ncores = ncores,
+                               ncores_inner = 1,
+                               parallel_inner = FALSE,
+                               formula = demand~demand_l1d+demand_l7d+pb(tod_uk),
+                               sigma.formula = ~pb(tod_uk),
+                               family = GB2,
+                               dt_tempdir = "C:/Users/Ciaran/Desktop/",
+                               lite=TRUE)
+  print(proc.time()-t1)
+  
+  
+  ## takes about 800s
+  t1 <- proc.time()
+  sm_models$m3 <- ml_pc_gamlss(melted_dt = lcl_data[id%in%sm_ids],
+                               vars = c("demand","demand_l1d","demand_l7d","tod_uk","dow_uk"),
+                               split_col = "id",
+                               sort_cols = "date_time",
+                               ncores = ncores,
+                               ncores_inner = 1,
+                               parallel_inner = FALSE,
+                               formula = demand~demand_l1d+demand_l7d+pb(tod_uk)+dow_uk,
+                               sigma.formula = ~pb(tod_uk),
+                               family = GB2,
+                               dt_tempdir = "C:/Users/Ciaran/Desktop/",
+                               lite=TRUE)
+  print(proc.time()-t1)
+  
+  
+  ## takes aboutZ 1300s
+  t1 <- proc.time()
+  sm_models$m4 <- ml_pc_gamlss(melted_dt = lcl_data[id%in%sm_ids],
+                               vars = c("demand","demand_l1d","demand_l7d","tod_uk","dow_uk","doy_uk"),
+                               split_col = "id",
+                               sort_cols = "date_time",
+                               ncores = ncores,
+                               ncores_inner = 1,
+                               parallel_inner = FALSE,
+                               formula = demand~demand_l1d+demand_l7d+pb(tod_uk)+dow_uk+
+                                 pbc(doy_uk,control = pbc.control(inter = 12),df=4),
+                               sigma.formula = ~pb(tod_uk),
+                               family = GB2,
+                               dt_tempdir = "C:/Users/Ciaran/Desktop/",
+                               lite=TRUE)
+  print(proc.time()-t1)
+  
+  
+  ### takes about 4000s for 20sms
+  t1 <- proc.time()
+  sm_models$m5 <- ml_pc_gamlss(melted_dt = lcl_data[id%in%sm_ids],
+                               vars = c("demand","demand_l1d","demand_l7d","tod_uk","dow_ftr","doy_uk"),
+                               split_col = "id",
+                               sort_cols = "date_time",
+                               ncores = ncores,
+                               ncores_inner = 1,
+                               parallel_inner = FALSE,
+                               formula = demand~demand_l1d+demand_l7d+pvc(tod_uk,by=dow_ftr)+
+                                 pbc(doy_uk,control = pbc.control(inter = 12),df=4),
+                               sigma.formula = ~pb(tod_uk),
+                               family = GB2,
+                               dt_tempdir = "C:/Users/Ciaran/Desktop/",
+                               lite=TRUE)
+  print(proc.time()-t1)
+  
+  # ## takes aboutZ 1700s
+  # t1 <- proc.time()
+  # sm_models$m6 <- ml_pc_gamlss(melted_dt = lcl_data[id%in%sm_ids],
+  #                              vars = c("demand","demand_l1d","demand_l7d","tod_uk","dow_uk",
+  #                                       "doy_uk","demandpk_l1d","tod_ftr"),
+  #                              split_col = "id",
+  #                              sort_cols = "date_time",
+  #                              ncores = ncores,
+  #                              ncores_inner = 1,
+  #                              parallel_inner = FALSE,
+  #                              formula = demand~demand_l1d+demand_l7d+pb(tod_uk)+dow_uk+
+  #                                demandpk_l1d + demandpk_l1d:tod_ftr +
+  #                                pbc(doy_uk,control = pbc.control(inter = 12),df=4),
+  #                              sigma.formula = ~pb(tod_uk),
+  #                              family = GB2,
+  #                              dt_tempdir = "C:/Users/Ciaran/Desktop/",
+  #                              lite=TRUE)
+  # print(proc.time()-t1)
+  # 
+  # 
+  # ## takes aboutZ 1300s
+  # t1 <- proc.time()
+  # sm_models$m7 <- ml_pc_gamlss(melted_dt = lcl_data[id%in%sm_ids],
+  #                              vars = c("demand","demand_l1d","demand_l7d","tod_uk","dow_uk",
+  #                                       "doy_uk","demandpk_l1d","tod_ftr"),
+  #                              split_col = "id",
+  #                              sort_cols = "date_time",
+  #                              ncores = ncores,
+  #                              ncores_inner = 1,
+  #                              parallel_inner = FALSE,
+  #                              formula = demand~demand_l1d+demand_l7d+pb(tod_uk)+dow_uk+
+  #                                demand_l1d:tod_ftr + demandpk_l1d + demandpk_l1d:tod_ftr +
+  #                                pbc(doy_uk,control = pbc.control(inter = 12),df=4),
+  #                              sigma.formula = ~pb(tod_uk),
+  #                              family = GB2,
+  #                              dt_tempdir = "C:/Users/Ciaran/Desktop/",
+  #                              lite=TRUE)
+  # print(proc.time()-t1)
+  # 
+  
+  
+  
+  
+  save(sm_models,file = paste0(data_save,"halfhourly_sm_subsamp.rda"),compress = "xz")
+  
+}
+
+
+
+
+```
+
+Now for the benchmarks in this case we will use kernel density estimates.
+
+- `bench_tod` is kde by each clock half hour
+- `bench_toddow` is kde by each clock half hour and day type (weekday/sat/sun)
+
+Note that each kde estimate uses different bandwidths, and only the data that belows to that particular half hour. This could perhaps be improved by using all the data but weighting the kde kernels for time of day. However then we run into the issue of optimising the bandwidth for the weighting etc
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+sm_models$bench_tod <- ml_kde(melted_dt = lcl_data[id%in%sm_ids],
+                              target_var = "demand",
+                              split_col = "id",
+                              sort_cols = "date_time",
+                              ncores = 8L,
+                              by_var = "tod_ftr",
+                              lite = TRUE)
+
+
+sm_models$bench_toddow <- ml_kde(melted_dt = lcl_data[id%in%sm_ids],
+                                 target_var = "demand",
+                                 split_col = "id",
+                                 sort_cols = "date_time",
+                                 ncores = 8L,
+                                 by_var = "toddow_ftr",
+                                 lite = TRUE)
+
+
+```
+
+
+Now to evaluate the predictions using CRPS. We will also use bootstrapping to calculate the average improvement over the `bench_tod`.
+
+Here are some interesting points
+
+- the simple and robust `m1` model is actually less skilful than the benchmark models
+  - there are clear benefits then to using the autoregressive terms in `m2`, even at the SM level
+- models `m1` to `m3` take about 800s to fit for 20 nodes, `m4` takes about 1300s, and `m5` about 4000s
+  - obviously there is a bit of a trade-off between forecast skill and computational time in this desktop study, we don't have unlimited resources
+  - for our full hierarchy `m5` will  take almost 2 days to fit the full 750 smart meters, this is not practical
+  - `m4` will take about 12hours which is I suppose OK, and `m1`-`m3` take about 3-4 hours
+- Therefore, although `m5` gives us the most skilful forecasts we will ignore this model from now on
+- I think `m4` is a decent trade-off between forecast skill and accuracy
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+t1 <- proc.time()
+# Initiate cluster
+cl <- makeCluster(pmin(length(sm_models),ncores))
+registerDoSNOW(cl)
+#set up progress bar
+iterations <- length(sm_models)
+pb <- txtProgressBar(max = iterations, style = 3)
+progress <- function(n) setTxtProgressBar(pb, n)
+opts <- list(progress = progress)
+
+# evaluate each model id
+eval_sm <- foreach(x = names(sm_models),.packages = c("data.table"),.options.snow = opts) %dopar% {
+  
+  grp <- sm_models[[x]][[1]]$by_var
+  
+  crps <- rbindlist(ml_crps_mods(mod_list = sm_models[[x]],
+                                 melted_dt = lcl_data[id%in%sm_ids],
+                                 sort_cols = c("aggregation","date_time"),
+                                 by_var = grp,
+                                 quantiles = seq(0.01,0.99,0.01)),idcol = "id")
+  
+  crps[kfold!="Test",kfold:="All_cv"]
+  
+  return(crps)
+  
+}
+print(proc.time()-t1)
+
+names(eval_sm) <- names(sm_models)
+
+close(pb)
+stopCluster(cl)
+rm(cl,iterations,progress,opts,pb)
+
+
+boot_data <- cbind(eval_sm$bench_tod,
+                   eval_sm$bench_toddow[,.(bench_toddow=crps)],
+                   eval_sm$m1[,.(m1=crps)],
+                   eval_sm$m2[,.(m2=crps)],
+                   eval_sm$m3[,.(m3=crps)],
+                   eval_sm$m4[,.(m4=crps)],
+                   eval_sm$m5[,.(m5=crps)])
+                   # eval_sm$m6[,.(m6=crps)],
+                   # eval_sm$m7[,.(m7=crps)])
+
+
+setnames(boot_data,"crps","bench_tod")
+
+t1 <- proc.time()
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench_tod")
+print(proc.time()-t1)
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench_tod [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+```
+
+
+
+
+Here is the skill score at the smart meter level. As you can see this is a more interesting and complex picture. Clearly this model only works well at a handful of nodes, but it works very well. It even degrades performance at some smart meters. But you can see overall the skill of the forecasts have improved, as shown previously.
+
+- This is another clear indication of the diversity of behaviours at the smart meter level
+
+
+```{r}
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","id","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench_tod")
+
+boot_dt[model_id%in%c("m4"),ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement over bench_tod [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(aggregation~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+
+```
+
+
+Here is the skill scoring during peak hours
+
+- not great against `bench_toddow` but overall not too bad
+
+```{r}
+
+
+
+boot_data <- boot_data[lcl_data[id%in%sm_ids,.(id,date_time,peak_ind)],on=.(id,date_time)]
+boot_data <- boot_data[peak_ind==1]
+boot_data[,peak_ind:=NULL]
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench_tod")
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench_tod [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+```
+
+<!-- ```{r} -->
+<!-- GB2()   #  -->
+<!-- y<- rGB2(200, mu=5, sigma=2, nu=1, tau=1) -->
+<!-- library(MASS) -->
+<!-- truehist(y) -->
+<!-- fx<-dGB2(seq(0.01, 20, length=200), mu=5 ,sigma=2, nu=1, tau=1) -->
+<!-- lines(seq(0.01,20,length=200),fx) -->
+<!-- integrate(function(x) x*dGB2(x=x, mu=5, sigma=2, nu=1, tau=1), 0, Inf) -->
+<!-- mean(y) -->
+<!-- curve(dGB2(x, mu=5 ,sigma=2, nu=1, tau=1), 0.01, 100,  -->
+<!--             main = "The GB2  density mu=[5,7,10,12], sigma=2, nu=1, tau=1") -->
+
+
+<!-- curve(dGB2(x, mu=7 ,sigma=2, nu=1, tau=1), 0.01, 100,add=T,col=2) -->
+
+
+<!-- curve(dGB2(x, mu=10 ,sigma=2, nu=1, tau=1), 0.01, 100, add=T,col=3) -->
+
+
+<!-- curve(dGB2(x, mu=12 ,sigma=2, nu=1, tau=1), 0.01, 100, add=T,col=4) -->
+
+<!-- ``` -->
+
+Here are example forecasts of `m4` at 6 of the smart meters over the course of a week
+
+
+```{r animation.hook="gifski", interval = 0.5}
+
+
+# sample_ids <- c("ps1","ss4","ss2_fdr3")
+set.seed(3)
+# sample_ids <- sort(lcl_data[id%in%sm_ids,sample(unique(id),6)])
+sample_ids <- sort(lcl_data[id%in%sm_ids,sample(unique(id),6)])[3:6]
+date_oi  <- lcl_data[,sample(unique(date_uk),1)]
+date_oi <- date_oi+1:7*60*60*24
+
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+
+  
+for(j in seq_along(date_oi)){
+  par(mfrow=c(2,2))
+    # par(mfrow=c(3,2))
+  for(i in sample_ids){
+    
+    
+    inds <- lcl_data[id==i][date_uk==date_oi[j],which=T] 
+    mqr_tmp <-  as.MultiQR.ppd_lite(sm_models$m4[[i]],
+                                    quantiles = seq(0.01,0.99,0.01),
+                                    index = inds)
+    
+        plot(mqr_tmp,q50_line = TRUE,targetTimes = lcl_data[id==i][date_uk==date_oi[j],tod_uk],
+         main=paste0(i," --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=c(0,ifelse(i=="N1174",2,1)),ylab="demand [kWh]",xlab = "time of day [hour]")
+    lcl_data[id==i][date_uk==date_oi[j],lines(tod_uk,demand)]
+  }
+  
+  
+  
+}
+
+
+
+```
+
+
+
+PIT, note that the KDE methods are not included here for now, since there's no PIT method currently implemented
+
+- calbration seems pretty good!
+
+```{r}
+
+
+sm_eval_pit <- lapply(names(sm_models)[1:3],function(x){
+  
+  rbindlist(lapply(names(sm_models[[x]]),function(y){
+    
+  
+    pit_out <- lcl_data[id==y,.(id,aggregation,date_time,kfold,demand)]
+    pit_out[,pit := PIT(sm_models[[x]][[y]],obs = demand)]
+    pit_out[,demand:=NULL]
+    pit_out[kfold!="Test",kfold:="All_cv"]
+
+  }))
+  
+  
+})
+names(sm_eval_pit) <- names(sm_models)[1:3]
+
+sm_eval_pit <- rbindlist(sm_eval_pit,idcol = "model_id")
+
+
+
+
+ggplot(data=sm_eval_pit, aes(x=pit)) +
+  labs(y = "density [-]", x = " probability level") +
+  geom_histogram(aes(y = stat(density)),closed = "left", fill = "grey75",
+                 color = "white", boundary=1, bins=20)+
+  geom_hline(aes(yintercept = 1,colour = "ideal"), linetype = "dashed")+
+  facet_grid(aggregation+kfold~model_id,scales = "free_y")+
+  theme(legend.position="top")
+
+
+```
+
+
+
+Lastly we will check the prediction calibration via reliability diagrams. As you can see over both the cross validation and testing datasets both forecasts are reasonably well calibrated, with the `bench_tod` model marginally better, this suggests that perhaps extending the regression to a more complex model for the GB2 scale and shape parameters might be beneficial. However this is outwith the scope.
+
+Additionally one or two SMs have terrible calibration in both models, this is due to a structural change in the time series (not shown) more on this later...
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+
+
+eval_sm_rel <- lapply(names(sm_models), function(x){
+  
+  grp <- sm_models[[x]][[1]]$by_var
+  
+  
+  crps <- rbindlist(ml_eval_mods(mod_list = sm_models[[x]],
+                                 metric = "rel",
+                                 melted_dt = lcl_data[id%in%sm_ids],
+                                 obs_col = "demand",
+                                 split_col = "id",
+                                 plot.it=FALSE,
+                                 sort_cols = c("aggregation","date_time"),
+                                 quantiles = seq(0.01,0.99,0.01),
+                                 by_var = grp),idcol = "id")
+  
+  
+  
+})
+
+names(eval_sm_rel) <- names(sm_models)
+
+
+
+
+
+temprel <- rbindlist(eval_sm_rel,idcol = "model")
+temp <- unique(lcl_data[id%in%sm_ids,.(id,aggregation,fdr_id,ss_id)])
+temprel <- temprel[temp,on=.(id)]
+
+ggplot(data=temprel[kfold%in%c("All_cv","Test")],aes(x=Nominal)) +
+  labs(y = "empirical coverage [-]", x = "nominal coverage [-]") +
+  geom_line(aes(y = Empirical,group =  id,colour=model)) +
+  # geom_point(aes(y = Empirical, group =  id),colour="steelblue", size = 1,alpha=.1) +
+  geom_line(aes(y=Nominal),colour = "black", linetype = "dashed") +
+  facet_grid(aggregation+kfold~model) +
+  theme(legend.position="top")+
+  guides(colour=guide_legend(title="forecast",nrow = 1,title.position = "top"))
+
+
+
+
+
+```
+
+
+
+Here are the time series for the two poorly calibrated forecasts
+
+- empty house feature?
+
+```{r}
+
+ids <- temprel[Nominal==.5 & Empirical>.6,unique(id)]
+
+ggplot(data=lcl_data[id%in%ids],
+       aes(x=date_time,y=demand))+
+  geom_line(colour="steelblue")+
+  facet_wrap(~id,nrow=1,scales = "free_y")
+
+
+
+
+rm(temprel,temp,mqr_tmp,boot_data,boot_dt,sm_models,eval_sm,eval_sm_rel,sm_eval_pit)
+invisible(gc())
+
+
+
+```
+
+
+## All households
+
+
+Here we fit the regression models for all the household. We will fit `m1`, `m2` and `m4` from the above section. Fitting `m1` will allow us to have a robust and simple gamlss model which should generate stable predictions at all locations.
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+sm_models <- list()
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_sm_m1.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_sm_m1.rda"))
+} else{
+  
+  
+  
+  # takes about 3-4hrs
+  t1 <- proc.time()
+  sm_model <- ml_pc_gamlss(melted_dt = lcl_data[aggregation=="sm"],
+                           vars = c("demand","tod_uk"),
+                           split_col = "id",
+                           sort_cols = "date_time",
+                           ncores = ncores,
+                           ncores_inner = 1,
+                           parallel_inner = FALSE,
+                           formula = demand~pb(tod_uk),
+                           sigma.formula = ~pb(tod_uk),
+                           family = GB2,
+                           dt_tempdir = "C:/Users/Ciaran/Desktop/",
+                           lite = TRUE)
+  print(proc.time()-t1)
+  
+  
+  save(sm_model,file = paste0(data_save,"halfhourly_sm_m1.rda"),compress = "xz")
+  
+}
+
+
+
+sm_models$m1 <- sm_model
+rm(sm_model)
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_sm_m2.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_sm_m2.rda"))
+} else{
+  
+  
+  
+  # takes about 3-4hrs.
+  t1 <- proc.time()
+  sm_model <- ml_pc_gamlss(melted_dt = lcl_data[aggregation=="sm"],
+                           vars = c("demand","demand_l1d","demand_l7d","tod_uk"),
+                           split_col = "id",
+                           sort_cols = "date_time",
+                           ncores = ncores,
+                           ncores_inner = 1,
+                           parallel_inner = FALSE,
+                           formula = demand~demand_l1d+demand_l7d+pb(tod_uk),
+                           sigma.formula = ~pb(tod_uk),
+                           family = GB2,
+                           dt_tempdir = "C:/Users/Ciaran/Desktop/",
+                           lite = TRUE)
+  print(proc.time()-t1)
+  
+  
+  save(sm_model,file = paste0(data_save,"halfhourly_sm_m2.rda"),compress = "xz")
+  
+}
+
+
+
+sm_models$m2 <- sm_model
+rm(sm_model)
+
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_sm_m4.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_sm_m4.rda"))
+} else{
+  
+  
+  
+  # takes about 13 hours....
+  t1 <- proc.time()
+  sm_model <- ml_pc_gamlss(melted_dt = lcl_data[aggregation=="sm"],
+                           vars = c("demand","demand_l1d","demand_l7d","tod_uk","dow_uk","doy_uk"),
+                           split_col = "id",
+                           sort_cols = "date_time",
+                           ncores = ncores,
+                           ncores_inner = 1,
+                           parallel_inner = FALSE,
+                           formula = demand~demand_l1d+demand_l7d+pb(tod_uk)+dow_uk+
+                             pbc(doy_uk,control = pbc.control(inter = 12),df=4),
+                           sigma.formula = ~pb(tod_uk),
+                           family = GB2,
+                           dt_tempdir = "C:/Users/Ciaran/Desktop/",
+                           lite = TRUE)
+  print(proc.time()-t1)
+  
+  
+  
+  save(sm_model,file = paste0(data_save,"halfhourly_sm_m4.rda"),compress = "xz")
+  
+}
+
+
+
+sm_models$m4 <- sm_model
+rm(sm_model)
+
+
+```
+
+
+
+Now here are the two kernel based models which are calculated for benchmark comparisons. Note that the second model takes up a bit of memory
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_sm_benchtod.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_sm_benchtod.rda"))
+} else{
+
+
+
+  # takes about 1.5 hrs
+  t1 <- proc.time()
+  sm_model <- ml_kde(melted_dt = lcl_data[aggregation=="sm"],
+                     target_var = "demand",
+                     split_col = "id",
+                     sort_cols = "date_time",
+                     ncores = ncores,
+                     by_var = "tod_ftr",
+                     lite = TRUE)
+  
+  print(proc.time()-t1)
+
+
+
+  save(sm_model,file = paste0(data_save,"halfhourly_sm_benchtod.rda"),compress = "xz")
+
+}
+
+
+
+sm_models$bench_tod <- sm_model
+rm(sm_model)
+
+
+
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_sm_benchtoddow.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_sm_benchtoddow.rda"))
+} else{
+
+
+
+  # takes about ..
+  t1 <- proc.time()
+  sm_model <- ml_kde(melted_dt = lcl_data[aggregation=="sm"],
+                     target_var = "demand",
+                     split_col = "id",
+                     sort_cols = "date_time",
+                     ncores = ncores,
+                     by_var = "toddow_ftr",
+                     lite = TRUE)
+  
+  print(proc.time()-t1)
+
+
+
+  save(sm_model,file = paste0(data_save,"halfhourly_sm_benchtoddow.rda"),compress = "xz")
+
+}
+
+
+
+sm_models$bench_toddow <- sm_model
+rm(sm_model)
+
+
+
+
+```
+
+
+
+
+Now to evaluate the predictions using CRPS. We will also use bootstrapping to calculate the average improvement over the `bench_tod`. Note that the forecasts are eating up a lot of memory here, so I've loaded the forecasts in the loop. To-re-run this (depending on your machine) you might have to remove the `sm_models` list from the environment, and re-load it after evaluation.
+
+- something clearly up with `m2` predictions at a few nodes
+- this is part of the motivation for fitting the robust `m1` model
+- note we only take 100 bootstraps here for computational reasons
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+### takes about 2-3hrs so save and load
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_sm_eval.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_sm_eval.rda"))
+} else{
+  
+  t1 <- proc.time()
+  # Initiate cluster
+  cl <- makeCluster(5)
+  registerDoSNOW(cl)
+  #set up progress bar
+  iterations <- 5
+  pb <- txtProgressBar(max = iterations, style = 3)
+  progress <- function(n) setTxtProgressBar(pb, n)
+  opts <- list(progress = progress)
+  invisible(gc())
+  
+  
+  # evaluate each model id load in each forecast to each worker instead?
+  eval_sm <- foreach(x = c("benchtod","benchtoddow","m1","m2","m4"),.packages = c("data.table"),.options.snow = opts) %dopar% {
+    
+    
+    load(paste0(data_save,"halfhourly_sm_",x,".rda"))
+    
+    grp <- sm_model[[1]]$by_var
+    
+    
+    crps <- rbindlist(ml_crps_mods(mod_list = sm_model,
+                                   melted_dt = lcl_data[aggregation=="sm"],
+                                   sort_cols = c("aggregation","date_time"),
+                                   by_var = grp,
+                                   quantiles = seq(0.01,0.99,0.01)),idcol = "id")
+    
+    crps[kfold!="Test",kfold:="All_cv"]
+    
+    return(crps)
+    
+  }
+  print(proc.time()-t1)
+  
+  names(eval_sm) <- c("benchtod","benchtoddow","m1","m2","m4")
+  
+  close(pb)
+  stopCluster(cl)
+  rm(cl,iterations,progress,opts,pb)
+  
+  save(eval_sm,file = paste0(data_save,"halfhourly_sm_eval.rda"),compress = "xz")
+  
+}
+
+
+
+
+boot_data <- cbind(eval_sm$benchtod,
+                   eval_sm$benchtoddow[,.(bench_toddow=crps)],
+                   eval_sm$m1[,.(m1=crps)],
+                   eval_sm$m2[,.(m2=crps)],
+                   eval_sm$m4[,.(m4=crps)])
+
+
+setnames(boot_data,"crps","bench_tod")
+
+set.seed(1)
+t1 <- proc.time()
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench_tod",
+                     nboot = 100)
+print(proc.time()-t1)
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench_tod [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+```
+
+Let's filter the ids for `m2` and `m4` which have 1.25*crps of the simple more robust `m1` model during cross validation
+
+
+```{r}
+
+
+
+temp <- setorder(boot_data[kfold!="Test",lapply(.SD,mean),by=.(id),.SDcols = 5:ncol(boot_data)],-m2)
+temp[m2>(m1*1.25) | m4>(m1*1.25)]
+
+
+
+
+```
+
+Here are the problematic SMs, obviously some clear structural breaks in the time series
+
+- for these sms we will switch to the more robust `m1` predictions
+- this imo is a similar approach to one that would happen in practice
+- this is only 8 out of ~750 smart meters
+
+
+```{r}
+
+
+ids <- temp[m2>(m1*1.25) | m4>(m1*1.25),id]
+
+ggplot(data=lcl_data[id%in%ids],
+       aes(x=date_time,y=demand))+
+  geom_line(colour="steelblue")+
+  facet_wrap(~id,nrow=2,scales = "free_y")
+
+```
+
+Lets sub in new models `m6` and `m7` which will be the `m2` and `m4` predictions respectively at all SMs except the above nodes, at which we will use the simple `m1` robust predictions
+
+
+```{r}
+
+sm_models$m6 <- append(sm_models$m1[ids],sm_models$m2[hier_ref[,id][!hier_ref[,id]%in%ids]])
+sm_models$m6 <- sm_models$m6[names(sm_models$m1)]
+
+
+
+sm_models$m7 <- append(sm_models$m1[ids],sm_models$m4[hier_ref[,id][!hier_ref[,id]%in%ids]])
+sm_models$m7 <- sm_models$m7[names(sm_models$m1)]
+
+
+eval_sm$m6 <- setorder(rbind(eval_sm$m1[id%in%ids],eval_sm$m2[!id%in%ids]),id,date_time)
+eval_sm$m7 <- setorder(rbind(eval_sm$m1[id%in%ids],eval_sm$m4[!id%in%ids]),id,date_time)
+
+
+```
+
+
+
+Now to evaluate the predictions using CRPS. We will also use bootstrapping to calculate the average improvement over the `bench_tod`.
+
+- we see a similar performance to the sub-sample from the previous section
+- note we only take 100 bootstraps here for computational reasons
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+boot_data <- cbind(eval_sm$benchtod,
+                   eval_sm$benchtoddow[,.(bench_toddow=crps)],
+                   eval_sm$m1[,.(m1=crps)],
+                   eval_sm$m6[,.(m6=crps)],
+                   eval_sm$m7[,.(m7=crps)])
+
+
+setnames(boot_data,"crps","bench_tod")
+
+t1 <- proc.time()
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench_tod",
+                     nboot = 100)
+print(proc.time()-t1)
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench_tod [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+```
+
+
+
+
+Here we visualise the per-node improvement by showing a histogram of the per-node skill scores. As you can see 
+
+- the `m1` model is consistently worse than the benchmark at all nodes
+- there is variable improvement for the `m6` and `m7` models, but clearly skewed to positive skill scores
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+temp <- boot_data[,lapply(.SD,mean),by=.(id,kfold),.SDcols = 5:ncol(boot_data)]
+temp <- temp[,lapply(.SD,function(x){((bench_tod-x)/bench_tod)*100}),
+          .SDcols=3:ncol(temp),keyby=.(id,kfold)]
+temp <- melt(temp,id.vars = c("id","kfold"))
+
+ggplot(data=temp[variable!="bench_tod"],aes(x = value))+
+  geom_histogram(stat = "density")+
+  facet_grid(kfold~variable)+
+  geom_vline(xintercept = 0,colour = "red", linetype = "dashed")
+
+
+
+```
+
+
+
+
+Here are example forecasts for 6 locations over the course of a week for the `bench_tod` model
+
+```{r animation.hook="gifski", interval = 0.5, warning = FALSE}
+
+
+# sample_ids <- c("ps1","ss4","ss2_fdr3")
+set.seed(3)
+sample_ids <- sort(lcl_data[aggregation=="sm",sample(unique(id),6)])
+date_oi  <- lcl_data[,sample(unique(date_uk),1)]
+date_oi <- date_oi+1:7*60*60*24
+
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+
+  
+for(j in seq_along(date_oi)){
+  par(mfrow=c(2,3))
+  for(i in sample_ids){
+    
+    
+    inds <- lcl_data[id==i][date_uk==date_oi[j],which=T] 
+    mqr_tmp <-  kde_2_MultiQR(sm_models$bench_tod[[i]],
+                              data = lcl_data[id==i][inds],
+                              quantiles = seq(0.01,0.99,0.01))
+    
+    plot(mqr_tmp,q50_line = TRUE,
+         main=paste0(i," --- bench_tod --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=lcl_data[id==i,range(demand)])
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+  }
+  
+  
+  
+}
+
+
+
+```
+
+Now for the `m7` model - nice!
+
+
+```{r animation.hook="gifski", interval = 0.5, warning = FALSE}
+
+
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+
+  
+for(j in seq_along(date_oi)){
+  par(mfrow=c(2,3))
+  for(i in sample_ids){
+    
+    
+    inds <- lcl_data[id==i][date_uk==date_oi[j],which=T] 
+    mqr_tmp <-  as.MultiQR.ppd_lite(sm_models$m7[[i]],
+                                    quantiles = seq(0.01,0.99,0.01),
+                                    index = inds)
+    
+    plot(mqr_tmp,q50_line = TRUE,
+         main=paste0(i," --- m7 --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=lcl_data[id==i,range(demand)])
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+  }
+  
+  
+  
+}
+
+
+
+```
+
+
+
+Here we visualise the per-node improvement by showing a histogram of the per-node skill scores versus the `bench_toddow` models. As you can see again
+
+- the `m1` model is consistently worse than the benchmark at all nodes
+- there is variable improvement for the `m6` and `m7` models, but skewed to positive skill scores
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+temp <- boot_data[,lapply(.SD,mean),by=.(id,kfold),.SDcols = 5:ncol(boot_data)]
+temp <- temp[,lapply(.SD,function(x){((bench_toddow-x)/bench_toddow)*100}),
+          .SDcols=3:ncol(temp),keyby=.(id,kfold)]
+temp <- melt(temp,id.vars = c("id","kfold"))
+
+ggplot(data=temp[variable!="bench_toddow"],aes(x = value))+
+  geom_histogram(stat = "density")+
+  facet_grid(kfold~variable)+
+  geom_vline(xintercept = 0,colour = "red", linetype = "dashed")
+
+
+
+```
+Let's verify this explicitly
+
+ - good!
+
+```{r}
+t1 <- proc.time()
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench_toddow",
+                     nboot = 100)
+print(proc.time()-t1)
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench_toddow [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+```
+
+Here is the evaluation during peak hours
+
+- again it looks like the `bench_todow` model is the best during the peaks
+- the advanced gamlss type models are only ~1-2\% worse though during cross validation than the `bench_tod` model, not too bad
+
+
+```{r}
+
+
+
+boot_data <- boot_data[lcl_data[aggregation=="sm",.(id,date_time,peak_ind)],on=.(id,date_time)]
+boot_data <- boot_data[peak_ind==1]
+boot_data[,peak_ind:=NULL]
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench_tod")
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench_tod [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+```
+
+
+
+Lastly we will check the prediction calibration via reliability diagrams. Note the light grey lines are for individual smart meters, and the solid colour indicates the average reliability of that model in that data partition
+
+- the calibration of the `benchtod` models are probably best
+    - although in the average calibration (solid colour) for the kernel method there is a strange bias at the lower quantiles
+- the calibration of the gamlss type models are good on average, and seem to get better as the model becomes more complex
+    - i.e. `m7` calibration looks the best of that class
+- overall the reliability of the predictions seem very good
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+rm(temp,mqr_tmp,boot_data,boot_dt)
+invisible(gc())
+
+
+### takes about 3hrs
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_sm_eval_rel.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_sm_eval_rel.rda"))
+} else{
+
+  t1 <- proc.time()
+  # Initiate cluster
+  cl <- makeCluster(5)
+  registerDoSNOW(cl)
+  #set up progress bar
+  iterations <- 5
+  pb <- txtProgressBar(max = iterations, style = 3)
+  progress <- function(n) setTxtProgressBar(pb, n)
+  opts <- list(progress = progress)
+  invisible(gc())
+
+
+  # evaluate each model id load in each forecast to each worker instead?
+  eval_sm_rel <- foreach(x = c("benchtod","benchtoddow","m1","m2","m4"),.packages = c("data.table",
+                                                                                      "ProbCast"),.options.snow = opts) %dopar% {
+
+
+    load(paste0(data_save,"halfhourly_sm_",x,".rda"))
+
+    grp <- sm_model[[1]]$by_var
+
+
+    crps <- rbindlist(ml_eval_mods(mod_list = sm_model,
+                                 metric = "rel",
+                                 melted_dt = lcl_data[aggregation=="sm"],
+                                 obs_col = "demand",
+                                 split_col = "id",
+                                 plot.it=FALSE,
+                                 sort_cols = c("aggregation","date_time"),
+                                 quantiles = seq(0.01,0.99,0.01),
+                                 by_var = grp),idcol = "id")
+
+    return(crps)
+
+  }
+  print(proc.time()-t1)
+
+  names(eval_sm_rel) <- c("benchtod","benchtoddow","m1","m2","m4")
+
+  close(pb)
+  stopCluster(cl)
+  rm(cl,iterations,progress,opts,pb)
+
+  save(eval_sm_rel,file = paste0(data_save,"halfhourly_sm_eval_rel.rda"),compress = "xz")
+
+}
+
+
+eval_sm_rel$m6 <- setorder(rbind(eval_sm_rel$m1[id%in%ids],eval_sm_rel$m2[!id%in%ids]),id)
+eval_sm_rel$m7 <- setorder(rbind(eval_sm_rel$m1[id%in%ids],eval_sm_rel$m4[!id%in%ids]),id)
+
+
+
+
+
+temprel <- rbindlist(eval_sm_rel,idcol = "model")
+temp <- unique(lcl_data[aggregation=="sm",.(id,aggregation,fdr_id,ss_id)])
+temprel <- temprel[temp,on=.(id)]
+temprel <- temprel[model%in%c("benchtod","m1","m6","m7") & kfold%in%c("All_cv","Test")]
+
+ggplot(data=temprel,aes(x=Nominal)) +
+  labs(y = "empirical coverage [-]", x = "nominal coverage [-]") +
+  geom_line(aes(y = Empirical,group =  id),colour="grey70",alpha=.5) +
+  geom_line(data=temprel[,.(Empirical=mean(Empirical)),keyby=.(model,Nominal,kfold)],
+            aes(y = Empirical,colour=model),alpha=1,size=1) +
+  geom_point(data=temprel[,.(Empirical=mean(Empirical)),keyby=.(model,Nominal,kfold)],
+            aes(y = Empirical,colour=model),alpha=1,size=1) +
+  # geom_point(aes(y = Empirical, group =  id),colour="steelblue", size = 1,alpha=.1) +
+  geom_line(aes(y=Nominal),colour = "black", linetype = "dashed") +
+  facet_grid(kfold~model) +
+  theme(legend.position="top")+guides(colour = guide_legend(nrow = 1))
+
+
+```
+
+
+
+PIT, note that the KDE methods are not included here for now, since there's no PIT method currently implemented
+
+- this looks surprisingly good actually imo, and again the `m7` model seems to improve things marginally
+
+```{r}
+
+
+sm_eval_pit <- lapply(names(sm_models)[c(1,6,7)],function(x){
+  
+  rbindlist(lapply(names(sm_models[[x]]),function(y){
+    
+  
+    pit_out <- lcl_data[id==y,.(id,aggregation,date_time,kfold,demand)]
+    pit_out[,pit := PIT(sm_models[[x]][[y]],obs = demand)]
+    pit_out[,demand:=NULL]
+    pit_out[kfold!="Test",kfold:="All_cv"]
+
+  }))
+  
+  
+})
+names(sm_eval_pit) <- names(sm_models)[c(1,6,7)]
+
+sm_eval_pit <- rbindlist(sm_eval_pit,idcol = "model_id")
+
+
+
+# this takes ages
+# ggplot(data=sm_eval_pit, aes(x=pit)) +
+#   labs(y = "density [-]", x = " probability level") +
+#   geom_histogram(aes(y = stat(density)),closed = "left", fill = "grey75",
+#                  color = "white", boundary=1, bins=20)+
+#   geom_hline(aes(yintercept = 1,colour = "ideal"), linetype = "dashed")+
+#   facet_grid(aggregation+kfold~model_id,scales = "free_y")+
+#   theme(legend.position="top")
+
+## precompute via hist
+quick_hist <- function(values_vec,...) {
+    res <- hist(values_vec, plot=FALSE, ...)
+
+    dat <- data.frame(xmin=head(res$breaks, -1L),
+                      xmax=tail(res$breaks, -1L),
+                      ymin=0.0,
+                      ymax=res$density)
+}
+
+
+
+temp <- sm_eval_pit[,as.list(quick_hist(pit, breaks=20)),by=.(aggregation,kfold,model_id)]
+
+
+ggplot(data=temp, aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)) +
+  labs(y = "density [-]", x = " probability level") +
+  geom_rect(fill = "grey75",color = "white")+
+  geom_hline(aes(yintercept = 1,colour = "ideal"), linetype = "dashed")+
+  facet_grid(aggregation+kfold~model_id)+
+  theme(legend.position="top")
+
+```
+
+
+
+# Session info
+
+
+```{r}
+
+hh_agg_models <- agg_models[c("bench","m5","m7","m8")]
+hh_agg_eval <- eval_agg[c("bench","m5","m7","m8")]
+hh_agg_eval_rel <- eval_agg_rel[c("bench","m5","m7","m8")]
+
+
+hh_sm_models <- sm_models[c("bench_tod","m6","m7")]
+hh_sm_eval <- eval_sm[c("benchtod","m6","m7")]
+# fix daft naming mistake...meh
+names(hh_sm_eval) <- c("bench_tod","m6","m7")
+hh_sm_eval_rel <- eval_sm_rel[c("benchtod","m6","m7")]
+names(hh_sm_eval_rel) <- c("bench_tod","m6","m7")
+
+s_file <- FALSE
+if(s_file | !file.exists(paste0(data_save,"halfhourly_smfc_out.rda"))){
+save(hh_agg_models, hh_agg_eval, hh_agg_eval_rel,
+     hh_sm_models, hh_sm_eval, hh_sm_eval_rel,file = paste0(data_save,"halfhourly_smfc_out.rda"),compress = "xz")
+}
+
+
+
+```
+
+
+
+
+```{r}
+
+sessionInfo()
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
