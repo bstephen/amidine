@@ -1,5 +1,5 @@
 ---
-title: "Amidine --- Day ahead half-hourly Forecasting"
+title: "Amidine --- Day ahead half-hourly forecasting - mixture/blend"
 author: "Ciaran Gilbert"
 date: "`r format(Sys.Date(),'%d-%m-%Y')`"
 output:
@@ -53,17 +53,14 @@ library(data.table)
 library(ggplot2)
 library(ProbCast)
 
-data_imp_loc <- "../../data/"
 data_save <- "../../saved_data/"
 
 # include utility functions
-source("../amidine_utils/amidine_utils.R")
+source("../utils/amidine_utils.R")
 
 ncores <- parallel::detectCores()
 
 
-### note in my ~/home/.Rprofile file I have configured R so it can use some paged memory for the big data processing
-### invisible(utils::memory.limit(64000))
 
 
 ```
@@ -242,6 +239,8 @@ pklcl_data[kfold=="fold3",kfold:="Test"]
 
 load existing forecasts from peak forecasting workbooks
 
+- these models correspond to the ones highlighted in the accompanying paper
+
 
 ```{r}
 
@@ -387,6 +386,7 @@ Now define the expert mixture models, as beta transformed linear pool. In this c
 - typical day ahead forecast
 - peak forecast at at each time, these will be the same within day
 - weighting, which in our case is the probability of a peak occurring at each time stamp
+- we take `m7` at the smart meter level from the previous day ahead work, and `m8` from the aggregated level models
 
 
 
@@ -1002,64 +1002,6 @@ ggplot(data=temp[!model_id%in%c("m5","m7","bench")], aes(xmin=xmin, xmax=xmax, y
 
 
 
-<!-- calibration -->
-
-<!-- ```{r warning = FALSE} -->
-
-
-<!-- hh_agg_eval_rel$blend <- rbindlist(ml_eval_mods(mod_list = hh_agg_models$blend, -->
-<!--                                                 metric = "rel", -->
-<!--                                                 melted_dt = lcl_data[aggregation!="sm"], -->
-<!--                                                 obs_col = "demand", -->
-<!--                                                 split_col = "id", -->
-<!--                                                 plot.it=FALSE, -->
-<!--                                                 sort_cols = c("aggregation","date_time"), -->
-<!--                                                 quantiles = seq(0.01,0.99,0.01)),idcol = "id") -->
-
-<!-- hh_agg_eval_rel$blend_opt <- rbindlist(ml_eval_mods(mod_list = hh_agg_models$blend_opt, -->
-<!--                                                     metric = "rel", -->
-<!--                                                     melted_dt = lcl_data[aggregation!="sm"], -->
-<!--                                                     obs_col = "demand", -->
-<!--                                                     split_col = "id", -->
-<!--                                                     plot.it=FALSE, -->
-<!--                                                     sort_cols = c("aggregation","date_time"), -->
-<!--                                                     quantiles = seq(0.01,0.99,0.01)),idcol = "id") -->
-
-<!-- hh_agg_eval_rel$blend_opthh <- rbindlist(ml_eval_mods(mod_list = hh_agg_models$blend_opthh, -->
-<!--                                                       metric = "rel", -->
-<!--                                                       melted_dt = lcl_data[aggregation!="sm"], -->
-<!--                                                       obs_col = "demand", -->
-<!--                                                       split_col = "id", -->
-<!--                                                       plot.it=FALSE, -->
-<!--                                                       sort_cols = c("aggregation","date_time"), -->
-<!--                                                       quantiles = seq(0.01,0.99,0.01)),idcol = "id") -->
-
-
-<!-- temprel <- rbindlist(hh_agg_eval_rel,idcol = "model") -->
-<!-- temp <- unique(lcl_data[aggregation!="sm",.(id,aggregation,fdr_id,ss_id)]) -->
-<!-- temprel <- temprel[temp,on=.(id)] -->
-<!-- temprel[,model:= factor(model,names(hh_agg_eval_rel))] -->
-
-
-<!-- ggplot(data=temprel[model%in%c("bench","m8","blend","blend_opt","blend_opthh") & kfold%in%c("All_cv","Test")], -->
-<!--        aes(x=Nominal)) + -->
-<!--   labs(y = "empirical coverage [-]", x = "nominal coverage [-]") + -->
-<!--   geom_line(aes(y = Empirical,group =  id,colour=model)) + -->
-<!--   # geom_point(aes(y = Empirical, group =  id),colour="steelblue", size = 1,alpha=.1) + -->
-<!--   geom_line(aes(y=Nominal),colour = "black", linetype = "dashed") + -->
-<!--   facet_grid(aggregation~kfold+model) + -->
-<!--   theme(legend.position="top")+ -->
-<!--   guides(colour=guide_legend(title="forecast",nrow = 1,title.position = "top")) -->
-
-
-
-
-<!-- ``` -->
-
-
-
-
-
 
 
 # Household level
@@ -1070,7 +1012,7 @@ Now here is an example over 7 days of the blending process
 
 - top left we have the original day ahead forecasts
 - top right we have the specialised peak forecast
-= bottom left we have the expert mixture, or blended forecast.
+- bottom left we have the expert mixture, or blended forecast.
 - bottom right are the weights applied to the peak forecast at each half hour in the lead time
 
 
@@ -1351,7 +1293,7 @@ ggplot(data=temp[!variable%in%c("bench1","peak")],aes(x = value))+
 
 Let's just now evaluate during the peak hours
 
-- nice (: this is the result I was hoping for
+- nice (:
 - note that the `peak` model is the upper limit of the skill if we had perfect knowledge of **when** the peaks will occur
 
 ```{r}

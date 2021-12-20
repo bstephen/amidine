@@ -14,12 +14,12 @@ library(data.table)
 library(ggplot2)
 library(ProbCast)
 
-data_imp_loc <- "../../data/"
+
 data_save <- "../../saved_data/"
 plot_save <- "../../outputs/paper_plots/"
 
 # include utility functions
-source("../amidine_utils/amidine_utils.R")
+source("../utils/amidine_utils.R")
 
 ncores <- parallel::detectCores()
 
@@ -550,7 +550,6 @@ save_plot(p1,name = "pit_peaki_agg")
 # let's clear the workspace
 rm(list=ls())
 
-data_imp_loc <- "../../data/"
 data_save <- "../../saved_data/"
 plot_save <- "../../outputs/paper_plots/"
 
@@ -631,7 +630,6 @@ save_plot(p1,name = "dens_peakt_sm")
 # let's clear the workspace
 rm(list=ls())
 
-data_imp_loc <- "../../data/"
 data_save <- "../../saved_data/"
 plot_save <- "../../outputs/paper_plots/"
 
@@ -904,60 +902,6 @@ p1 <- ggplot(data=temp, aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)) +
 save_plot(p1,name = "pit_hh_sm")
 
 
-
-
-########################################################################
-### FINITO
-########################################################################
-
-join_data <- rbind(cbind(hh_sm_eval$blend[,.(id,date_time,crps)],hh_sm_eval$bench_tod[,.(bench=crps)]),
-                   cbind(hh_agg_eval$blend[,.(id,date_time,crps)],hh_agg_eval$bench[,.(bench = crps)]))
-
-lcl_data[join_data,crps:=crps,on = .(id,date_time)]
-lcl_data[join_data,bench:=bench,on = .(id,date_time)]
-rm(join_data)
-
-
-
-temp <- lcl_data[,.(crps=mean(crps),
-                    bench = mean(bench),
-                    skill = (1-(mean(crps)/mean(bench)))*100,
-                    lag1cor = cor(demand,shift(demand,n = 1),use = "complete"),
-                    lag24cor = cor(demand,shift(demand,n = 48),use = "complete"),
-                    mv = mean(demand),
-                    vv = sd(demand),
-                    pv = max(demand)),keyby = .(aggregation,id,peak_ind)]
-
-
-
-ggplot(data=temp[aggregation!="sm"], aes(x = vv, y= skill)) +
-  geom_point(colour = "steelblue")+
-  facet_grid(~peak_ind)+
-  geom_smooth()+
-  theme(legend.position="top")
-
-
-
-ggplot(data=temp[aggregation!="sm" & peak_ind==0], aes(x = lag24cor, y= skill)) +
-  geom_point(colour = "steelblue")+
-  geom_smooth()+
-  facet_grid(~peak_ind,scales = "free_x")+
-  theme(legend.position="top")
-
-
-
-ggplot(data=temp[aggregation=="sm"], aes(x = vv, y= skill)) +
-  geom_point(colour = "steelblue")+
-  facet_grid(~peak_ind)+
-  theme(legend.position="top")
-
-
-ggplot(data=temp[aggregation=="sm" & peak_ind==1], 
-       aes(x = lag1cor, y= skill)) +
-  geom_point(colour = "steelblue")+
-  geom_smooth()+
-  facet_grid(~peak_ind)+
-  theme(legend.position="top")
 
 
 

@@ -1,7 +1,7 @@
 ## amedine helper functions
 
 
-packages <- c("data.table","ProbCast","gamlss.tr","crch","lubridate","mgcv")
+packages <- c("data.table","ProbCast","gamlss.tr","crch","lubridate","mgcv","scoringRules")
 install.packages(setdiff(packages, rownames(installed.packages())))
 
 library(data.table)

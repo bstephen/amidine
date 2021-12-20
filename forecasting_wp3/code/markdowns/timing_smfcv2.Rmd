@@ -52,17 +52,13 @@ library(data.table)
 library(ggplot2)
 library(ProbCast)
 
-data_imp_loc <- "../../data/"
 data_save <- "../../saved_data/"
 
 # include utility functions
-source("../amidine_utils/amidine_utils.R")
+source("../utils/amidine_utils.R")
 
 ncores <- parallel::detectCores()
 
-
-### note in my ~/home/.Rprofile file I have configured R so it can use some paged memory for the big data processing
-### invisible(utils::memory.limit(64000))
 
 
 ```
@@ -78,35 +74,6 @@ hier_ref
 
 
 ```
-
-<!-- alternative peak definition (doesn't seem to have an effect at aggregatelevels, so let's just keep the first max each day) -->
-
-<!-- ```{r} -->
-
-
-<!-- lcl_data[,peak_ind := 0] -->
-<!-- # this is a weird line, but the inside term gets the rows in the larger table -->
-<!-- # where demand is maximum by group, returns V1 which is the row index of the larger table -->
-<!-- # not that this returns the first maxmum per day -->
-<!-- # lcl_data[lcl_data[, .I[which.max(demand)], by = .(date_uk,id)]$V1,peak_ind2:=1] -->
-<!-- lcl_data[lcl_data[, .I[tail(which(demand==max(demand)),1)], by = .(date_uk,id)]$V1,peak_ind:=1] -->
-
-<!-- # multiple peaks per day fn -->
-<!-- # lcl_data[,peak_ind_mult := 0] -->
-<!-- # lcl_data[lcl_data[, .I[demand == max(demand)], by = .(date_uk,id)]$V1,peak_ind_mult:=1] -->
-<!-- # lcl_data[peak_ind_mult==1 & peak_ind==0] -->
-<!-- # lcl_data[date=="2013-01-01" & id=="N0017"] -->
-<!-- # lcl_data[,peak_ind_mult:=NULL] -->
-
-<!-- # ok it seems we have the right number of peaks, each day has 780 -->
-<!-- lcl_data[peak_ind==1,.N,by=.(date_uk)][,unique(N)] -->
-<!-- lcl_data[peak_ind==1] -->
-
-
-
-
-
-<!-- ``` -->
 
 
 
@@ -772,10 +739,10 @@ From inspection of the RPS results
 - seems like cyclical penalised splines work reasonably well, when you keep `k` high in the formula --> `m1` to `m2`
 - day of year is massively important for skill, in `m3`
 - seasonal interactions are clearly important, especially at feeder level, in `m4`
-- binomial family, rather than poisson is better as well (not shown), why?!
+- binomial family, rather than poisson is better as well (not shown)
 - adding the demand intensity lag didn't help much (not shown)
 - best model it seems to me includes the weekend/weekday factor and the tensor seasonal spline, `m5`, when considering the cross validation and testing scores across the aggregate levels
-- also we only have a only year to learn the day-of-year seasonal and interaction effect, but it's obviously very important. Discuss further?
+- also we only have a only year to learn the day-of-year seasonal and interaction effect, but it's obviously very important.
 
 
 ```{r warning = F, fig.height = 7.5, results = 'hide'}
@@ -1376,39 +1343,6 @@ lapply(sm_models,function(x){x[[1]]$models$Test$formula})
 
 
 
-<!-- ```{r} -->
-<!-- # # time-of-day and day of year interaction - takes a bit of time -->
-<!-- # sm_models$m4 <- ml_pc_mgcv(melted_dt = pamm_data[id%in%smp_ids], -->
-<!-- #                            vars = c("peak","doy_uk"), -->
-<!-- #                            split_col = "id", -->
-<!-- #                            sort_cols = c("date_uk","time_ind"), -->
-<!-- #                            formula = peak ~ te(doy_uk,time_ind,bs=c("cp","cr"), k = 10), -->
-<!-- #                            knots=list(doy_uk=c(0,365)), -->
-<!-- #                            cv_folds = "kfold", -->
-<!-- #                            ncores = ncores, -->
-<!-- #                            ncores_inner = 1L, -->
-<!-- #                            family = stats::binomial()) -->
-<!-- #  -->
-<!-- #  -->
-<!-- #  -->
-<!-- # pamm_data[,dow_ftr:= as.factor(dow_ftr)] -->
-<!-- # # time-of-day and day of year interaction - takes a bit of time -->
-<!-- # sm_models$m5 <- ml_pc_mgcv(melted_dt = pamm_data[id%in%smp_ids], -->
-<!-- #                            vars = c("peak","doy_uk","dow_ftr"), -->
-<!-- #                            split_col = "id", -->
-<!-- #                            sort_cols = c("date_uk","time_ind"), -->
-<!-- #                            formula = peak ~ te(doy_uk,time_ind,bs=c("cp","cr"), k = 10) + dow_ftr, -->
-<!-- #                            knots=list(doy_uk=c(0,365)), -->
-<!-- #                            cv_folds = "kfold", -->
-<!-- #                            ncores = ncores, -->
-<!-- #                            ncores_inner = 1L, -->
-<!-- #                            family = stats::binomial()) -->
-
-
-<!-- lapply(sm_models,function(x){x[[1]]$models$Test$formula}) -->
-
-
-<!-- ``` -->
 
 Some thoughts on the results 
 
@@ -1635,24 +1569,6 @@ ggplot(data=temprel[model%in%c("bench","m4")],aes(x=Nominal)) +
   theme(legend.position="top")+guides(colour = guide_legend(nrow = 1))
 
 ```
-
-
-
-
-<!-- - revise concepts of tte analysis -->
-<!-- - file:///C:/Users/Ciaran/Downloads/1-s2.0-S0306261921011326-main.pdf -->
-<!-- - bruce's papers  -->
-<!--   https://www.sciencedirect.com/science/article/pii/S0378779620305356?via%3Dihub  -->
-<!--   https://ieeexplore.ieee.org/document/9250693 -->
-<!-- - 48hr forecasts -->
-
-
-
-
-
-<!-- - manually adjust penalisation -->
-<!-- - global model, one model? -->
-<!-- - multivriate skill scores? -->
 
 
 

@@ -52,17 +52,12 @@ library(data.table)
 library(ggplot2)
 library(ProbCast)
 
-data_imp_loc <- "../../data/"
 data_save <- "../../saved_data/"
 
 # include utility functions
-source("../amidine_utils/amidine_utils.R")
+source("../utils/amidine_utils.R")
 
 ncores <- parallel::detectCores()
-
-
-### note in my ~/home/.Rprofile file I have configured R so it can use some paged memory for the big data processing
-### invisible(utils::memory.limit(64000))
 
 
 ```
@@ -223,20 +218,6 @@ ggplot(data=lcl_data[aggregation!="sm"],aes(y=demand,x=demand_l1d))+
 ```
 
 
-
-<!-- ```{r} -->
-
-
-<!-- ggplot(data=lcl_data[aggregation!="sm"],aes(y=demand,x=demandpk_l1d))+ -->
-<!--   labs(y = "demand [kWh]",x = "demand lag 1d [kWh]")+ -->
-<!--   geom_point(size=0.1,colour="steelblue",alpha=.5)+ -->
-<!--   facet_wrap(~aggregation,nrow=1,scales = "free") -->
-
-
-
-
-
-<!-- ``` -->
 
 
 The task at hand here is to predict the energy demand at the day-ahead horizon
@@ -645,7 +626,7 @@ You can see the skill of the forecasts steadily increasing as the model becomes 
 - There is also a significant jump between the `m5` and `m6` model which shows how important the yesterday's peak effect is, as well as it's interaction term with time of day
 - the `m7` model arguably improves the skill in CV but not so much in testing
 - the `m8` model shows a slight reduction in skill compared to `m7` but performs well during the daily peaks as will be shown later
-- Generally, the skill score magnitudes reduce as you go down the voltage levels as demand befomes less smooth and more difficult to predict
+- Generally, the skill score magnitudes reduce as you go down the voltage levels as demand becomes less smooth and more difficult to predict
 
 
 ```{r message=FALSE,warning=FALSE,results='hide'}

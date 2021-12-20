@@ -42,15 +42,12 @@ library(ggplot2)
 library(gamlss.tr)
 library(pbapply)
 
-data_imp_loc <- "../../data/"
+
 data_save <- "../../saved_data/"
 
 # include utility functions
-source("../amidine_utils/amidine_utils.R")
+source("../utils/amidine_utils.R")
 
-
-### note in my ~/home/.Rprofile file I have configured R so it can use some paged memory for the big data processing
-### invisible(utils::memory.limit(64000))
 
 
 ```
@@ -204,9 +201,8 @@ pklcl_data
 
 ## aggregate forecasting - gamlss
 
-- CONVERGENCE! test models for convergence...
 
-As shown in the plots previously, modeling the aggregate level peak demand will be quite different to forecasting at the SM level
+As shown in the plots previously, modelling the aggregate level peak demand will be quite different to forecasting at the SM level
 
 For the aggregate levels we will use generalized additive models for location, shape, and scale. This is motivated by
 
@@ -344,7 +340,7 @@ ggplot(data=eval_agg$pball[kfold%in%c("All_cv","Test")],aes(x= Quantile)) +
 
 ```
 
-The pits are obv a bit all over the place, we don't have enough data to properly evaluate this way...
+The pits are obv a bit all over the place, we don't have enough data to properly evaluate this way on an individal level...
 
 
 ```{r fig.height=15,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
@@ -880,16 +876,8 @@ pklcl_data[aggregation!="sm",ggplot(data=.SD, aes(x=pit_m3)) + labs(y = "density
 
 And have a look at the correlation matrix between the PIT values between the different levels
 
-- is this hypothetical hierarchy truly representative? must have massive impact on results
-- we saw similar results previously - there is obv high correlation on the hierarchy structure
-- there are correlation 'blocks'
-- there is fairly low correlation at the feeder level
-- is this representative in practice? this is saying that feeder demand is uncorrelated basically, because of random SM sampling assignment, but is this truly representative?
-- e.g. wealthier areas with higher demand will typically serve the same ss
-- e.g. neighbor effect of buying EV/battery etc.
-- oxford study, WP clustering of similar profiles
-
-- from the results anyway, I think we could safely split up the copula?
+- is this hypothetical hierarchy truly representative? must have impact on PIT correlations results
+- there are correlation 'blocks' within aggregate levels
 
 ```{r fig.height=15,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
 
@@ -925,59 +913,13 @@ invisible(gc())
 
 
 
-<!-- ```{r fig.height=3,fig.width=15,message=FALSE,warning=FALSE,results='hide'} -->
-
-
-<!-- sample_ids <- pklcl_data[aggregation!="sm",sort(unique(id))] -->
-<!-- par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r] -->
-<!-- par(tcl=0.35)  # Switch tick marks to insides of axes -->
-<!-- par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line] -->
-<!-- par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension) -->
-<!-- par(mfrow=c(1,5)) -->
-<!-- for(i in sample_ids){ -->
-<!-- tempdata <- pklcl_data[id==i & kfold!="Test"] -->
-<!-- fold <- "Test" -->
-<!-- term.plot(agg_m3[[i]]$Test,what = "mu",rug = TRUE,ask = FALSE,data = tempdata,ylim = "free",main=i,cex.lab=.9) -->
-
-<!-- } -->
-
-
-
-<!-- ``` -->
-
-
-<!-- ```{r} -->
-
-<!-- sum(sapply(agg_m3,function(z){sum(sapply(z,function(x){x$converged}))==3}))==length(agg_m3) -->
-
-<!-- sapply(agg_m3$ps1,function(x){x$converged}) -->
-
-<!-- plot(agg_m3$ps1$Test) -->
-
-
-
-
-<!-- ``` -->
-
-
 Some notes
 
-
-- nb: checked monotonic penalised splines for fixing negative linear relationship - no help
-- nb: checked random() for factor shrinkage, need to understand better :s - no help
-- nb: checked ri() - couldn't get to work
-- nb: pbv(lagged_demand, dow_ftr) - no help
-
-next steps and development...
-- benchmarks ETS bootstraps/ARIMA gaussian/ARMA-GARCH
-- GB2 family?
-- interactions! variance and lagged demand?
-- more lags (2,3,15) from ACF --->
 - temperature variable?
-- we're missing the peaks when it's freezing cold
-- temp forecasts? freezing/not freezing cat.
-- midas data...ecmwf forecasts averaged over london? or min-of-mins?
-- boosting would help with variable selection on per-node basis - pbz() --- gamboostLSS! --- xgboostLSS? --- https://github.com/StatMixedML/XGBoostLSS
+  - we're missing the peaks when it's freezing cold
+  - temp forecasts? freezing/not freezing cat.
+  - midas data...ecmwf forecasts averaged over london?
+- boosting would help with variable selection on per-node basis --- gamboostLSS!
 - holidays?
 
 ## smart meter forecasting - subset at secondary substation 4 (ss4)
@@ -1072,9 +1014,8 @@ Here is a plot of these node's histograms
 
 - There's clearly no node where we have any 'net demand' (confirmed below)
 - therefore we have to consider strictly positive distributions
-<!-- - we will use the truncated normal as our conditional distribution for a gamlss -->
 - since we are close to zero now, we need to consider this rather than rely on the thin tails of the gaussian as before :)
-<!-- - some nodes (e.g. N0304) clearly has a sort of minimum peak demand level (0.4kWh) whereas others can have potentially v. small minimum peak demand -->
+
 
 ```{r fig.height=5,fig.width=15}
 
@@ -1084,11 +1025,6 @@ ggplot(data=melt(pklcl_data[id%in%smp_ids,.(id,demand)],measure.vars =2))+
   labs(x = "max demand [kWh]")+
   geom_histogram(aes(value),bins=100)+
   facet_grid(~id,scales = "free_y")
-
-# ggplot(data=melt(pklcl_data[id%in%smp_ids,.(id,demand,log_demand=log(demand))],measure.vars =2:3))+
-#   labs(x = "max demand [kWh]")+
-#   geom_histogram(aes(value),bins=100)+
-#   facet_grid(variable~id,scales = "free")
 
 
 
@@ -1114,10 +1050,10 @@ I'm not 100% sure what conditional distribution will be suitable here
 
 Ok so we've cycled through the densities and fit a range of marginal distributions to the peak demand data. The following table of counts, shows the top marginal distribution at each node
 
-- these give an idea of what could be a useful conditional distribution I've found empirically
+- these give an idea of what could be a useful conditional distribution I've found
 - the BCPE has a tendency to fail in my experience
-- we will try the GB2 distribution, we have prior experience and it worked really well
-- truncated gaussian was also tried (not shown), but was failing at some nodes
+- we will try the GB2 distribution, I have prior experience and it worked really well
+- truncated gaussian was also tried (not shown), but was failing at some nodes due to proximity of some SMs to zero I think
 
 ```{r fig.height=10,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
 
@@ -1436,7 +1372,7 @@ Let's have a look at the fan plots for these problem nodes, and a good performin
 - at the first node, we can see that the forecast seems to give reasonable forecasts with dynamic uncertainty
 - holidays are clearly important to consider - rle or changepoint?
 - the benchmark model has dynamic uncertainty because it's GB2 distribution
-- the extra parameters hlp clearly at this node to reduce the uncertainty
+- the extra parameters help clearly at this node to reduce the uncertainty
 - at the second/third node, including the lag dependency on the scale parameter leads to unrealistic spikes
 - we see unrealistic spikes in even in the benchmark
 
@@ -1577,7 +1513,7 @@ lapply(sm_gamlss,function(y){sum(sapply(y,function(z){sum(sapply(z,function(x){x
 
 
 - nb: the dow_ftr/demand lag was causing a spike at some nodes, in the sigma formula for the model
-- I don't think it makes sense to over-engineer the location shape and scale parameters for the GB2, because the $\mu$ value already effects the shape of the distribution
+- I don't think it makes sense to over-engineer the location shape and scale parameters for the GB2, because the $\mu$ value already effects the scale of the distribution
 
 - from the looks of the CRPS we seem to have made stable predictions now, across all the SMs
 - yay!
@@ -2317,63 +2253,6 @@ sessionInfo()
 
 ```
 
-<!-- ```{r} -->
-
-
-<!-- tmp <- pklcl_data[id%in%c("N0003","N2206")] -->
-
-<!-- save(tmp,file="tmp.rda") -->
-
-<!-- #  -->
-<!-- # fwrite(lcl_data[aggregation=="sm",.(date_time_utc=date_time,id,demand)],file = "../data/lowcarbonlondon/ukds/lcl_clean.csv", -->
-<!-- #        dateTimeAs = "write.csv") -->
-
-
-
-<!-- ``` -->
-
-
-
-
-
-# next steps/notes
-- gamboostLSS? could be good for feature selection, and has better base learner features
-- seasonality 
-- tod_peaklag
-- mode(demand)
-- markov switching for regimes, mixture model
-- grouping of sms might help holiday definition, logistic for predicting prob of holiday on whole grup ---> features
-
-
-
-- analog ensemble?
-- EVT gam
-- hierarchy with copula for each level take samples and enforce coherency on samples?
-
-https://github.com/anastasiospanagiotelis/ProbReco
-https://robjhyndman.com/publications/coherentprob/
-https://www.monash.edu/business/ebs/research/publications/ebs/wp02-2019.pdf
-https://reader.elsevier.com/reader/sd/pii/S0167947311000971?token=F2B42952A4548AFA3EC51F6AA409FA6ED48C7CD3C8EB6D394BBC54DE49967A674927D35D15C3EC1D5A4216324279D84A
-
-- bottom-up/ top-down https://cran.r-project.org/web/packages/hts/vignettes/hts.pdf,https://www.lancaster.ac.uk/~morganle/images/HierarchicalModels.pdf https://cloud.r-project.org/web/packages/fable/index.html
-- VAR for forecast reconciliation https://robjhyndman.com/talks/Hierarchical.pdf (23)
-
-
-- covariances
-- literature review peaks
-- literature review LCL data
-
-
-- gam multi-resolution EDF, advanced tensor effects?
--- ordinal categorical (time-of-peak) https://explorablemultiverse.github.io/examples/likert/R/analysis.html
--- generalised extreme value - peak intensity
-
--- functional regression? scalar (out) function(adaily lags)
-
-
-
-https://fromthebottomoftheheap.net/2014/05/09/modelling-seasonal-data-with-gam/
-https://link.springer.com/content/pdf/10.1186/s12874-019-0666-3.pdf
 
 
 
