@@ -556,7 +556,7 @@ p1 <- boot_dt[model_id=="gamlss2",ggplot(data=.SD, aes(x=id,y=score))
               +theme(legend.position="top",
                      text=element_text(family="serif",size=8),
                      strip.background =element_rect(fill="white"))]
-ggsave(paste0(plot_save,"boot_peaki_agg.pdf"),plot = p1, width=90,height=60,units = "mm")
+ggsave(paste0(plot_save,"boot_peaki_agg.pdf"),plot = p1, width=90,height=120,units = "mm")
 # save_plot(p1,name = "boot_peaki_agg")
 
 
@@ -635,7 +635,7 @@ p1 <- boot_dt[model_id=="gam",ggplot(data=.SD, aes(x=id,y=score))
               +theme(legend.position="top",
                      text=element_text(family="serif",size=8),
                      strip.background =element_rect(fill="white"))]
-ggsave(paste0(plot_save,"boot_peakt_agg.pdf"),plot = p1, width=90,height=60,units = "mm")
+ggsave(paste0(plot_save,"boot_peakt_agg.pdf"),plot = p1, width=90,height=120,units = "mm")
 # save_plot(p1,name = "boot_peakt_agg")
 
 
@@ -744,7 +744,7 @@ p1 <- boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score))
               +theme(legend.position="top",
                      text=element_text(family="serif",size=8),
                      strip.background =element_rect(fill="white"))]
-ggsave(paste0(plot_save,"boot_hh_agg.pdf"),plot = p1, width=90,height=60,units = "mm")
+ggsave(paste0(plot_save,"boot_hh_agg.pdf"),plot = p1, width=90,height=120,units = "mm")
 # p1 <- save_plot(p1,name = "boot_hh_agg")
 
 
@@ -766,7 +766,7 @@ p1 <- boot_dt[model_id=="fusion",ggplot(data=.SD, aes(x=id,y=score))
               +theme(legend.position="top",
                      text=element_text(family="serif",size=8),
                      strip.background =element_rect(fill="white"))]
-ggsave(paste0(plot_save,"boot_hh_aggid.pdf"),plot = p1, width=90,height=60,units = "mm")
+ggsave(paste0(plot_save,"boot_hh_aggid.pdf"),plot = p1, width=90,height=120,units = "mm")
 # p1 <- save_plot(p1,name = "boot_hh_aggid")
 
 ########### pick out peak hours
@@ -793,7 +793,7 @@ p1 <- boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score))
               +theme(legend.position="top",
                      text=element_text(family="serif",size=8),
                      strip.background =element_rect(fill="white"))]
-ggsave(paste0(plot_save,"boot_hhpk_agg.pdf"),plot = p1, width=90,height=60,units = "mm")
+ggsave(paste0(plot_save,"boot_hhpk_agg.pdf"),plot = p1, width=90,height=120,units = "mm")
 # p1 <- save_plot(p1,name = "boot_hhpk_agg")
 
 
@@ -816,7 +816,7 @@ p1 <- boot_dt[model_id=="fusion",ggplot(data=.SD, aes(x=id,y=score))
               +theme(legend.position="top",
                      text=element_text(family="serif",size=8),
                      strip.background =element_rect(fill="white"))]
-ggsave(paste0(plot_save,"boot_hhpk_aggid.pdf"),plot = p1, width=90,height=60,units = "mm")
+ggsave(paste0(plot_save,"boot_hhpk_aggid.pdf"),plot = p1, width=90,height=120,units = "mm")
 # save_plot(p1,name = "boot_hhpk_aggid")
 
 
