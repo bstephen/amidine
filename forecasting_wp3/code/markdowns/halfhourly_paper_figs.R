@@ -28,6 +28,15 @@ ncores <- parallel::detectCores()
 ### now let's load the data from the data exploration and preparation document
 load(paste0(data_save,"prep_expl_smfc_outv2.rda"))
 
+####
+# Model naming:
+# Problems: hh/PI/PT  :  Agg, House
+# Versions: full, simplified, benchmark
+#
+# Change HH language to "Benchmark" "Simple"  "Full" ("Fusion")
+# PI: kde1, kde2, "Simple" "Full"
+# PT: Benchmark, Hazard
+####
 
 ########################################################################
 ### aggregated time series
@@ -60,6 +69,7 @@ p1 <- ggplot(data=tmp_plot,aes(x=date_time,y=av_demand))+
 
 # save_plot(p1,name = "sm_agg_intro")
 ggsave(paste0(plot_save,"sm_agg_intro.pdf"),plot = p1, width=180,height=120,units = "mm")
+ggsave(paste0(plot_save,"sm_agg_intro_small.pdf"),plot = p1, width=90,height=60,units = "mm")
 rm(tmp_plot,wk)
 
 
@@ -220,13 +230,13 @@ rm(p1,plot_data)
 
 pklcl_data <- na.omit(pklcl_data)
 pklcl_data[aggregation=="ps",aggregation_plot:="Primary substation"]
-pklcl_data[aggregation=="ss",aggregation_plot:="Secondary substation"]
-pklcl_data[aggregation=="fdr",aggregation_plot:="Feeder"]
-pklcl_data[aggregation=="sm",aggregation_plot:="Household"]
-pklcl_data[,aggregation_plot := factor(aggregation_plot,levels = c("Primary substation","Secondary substation",
-                                                                   "Feeder","Household"))]
+pklcl_data[aggregation=="ss",aggregation_plot:="Secondary substations"]
+pklcl_data[aggregation=="fdr",aggregation_plot:="Feeders"]
+pklcl_data[aggregation=="sm",aggregation_plot:="Households"]
+pklcl_data[,aggregation_plot := factor(aggregation_plot,levels = c("Primary substation","Secondary substations",
+                                                                   "Feeders","Households"))]
 
-p1 <- ggplot(data=rbind(pklcl_data[aggregation_plot!="Household",],pklcl_data[aggregation_plot=="Household",][sample(1:.N,size = 2e4)]),
+p1 <- ggplot(data=rbind(pklcl_data[aggregation_plot!="Households",],pklcl_data[aggregation_plot=="Households",][sample(1:.N,size = 2e4)]),
              aes(y=demand,x=demandpk_l1))+
   labs(y = "Dialy peak demand [kWh]",x = "Daily peak demand lag 1 [kWh]")+
   geom_point(colour="steelblue",size=0.1)+
@@ -461,7 +471,10 @@ print(proc.time()-t1)
 
 
 # skill scores bootstraps
-
+boot_dt[model_id=="kde1",model_id:="KDE1"]
+boot_dt[model_id=="kde2",model_id:="KDE2"]
+boot_dt[model_id=="gamlss1",model_id:="Simple"]
+boot_dt[model_id=="gamlss2",model_id:="Full"]
 p1 <- boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) 
               +labs(y = "CRPS skill score [%]", x = "Model")
               +geom_boxplot()
@@ -481,6 +494,9 @@ temp <- temp[,lapply(.SD,function(x){(1-(x/kde1))*100}),
 temp <- melt(temp,id.vars = c("id","kfold"))
 
 # skill score density
+temp[variable=="kde2",variable:="KDE2"]
+temp[variable=="gamlss1",variable:="Simple"]
+temp[variable=="gamlss2",variable:="Full"]
 p1 <- ggplot(data=temp[variable!="kde1"],aes(x = value, y = ..density..))+
   geom_histogram(binwidth = 1,fill = "grey50")+
   facet_grid(kfold~variable)+
@@ -513,7 +529,8 @@ sm_eval_pit <- lapply(c("sm_bench","sm_m4"),function(x){
   }))
 })
 print(proc.time()-t1)
-names(sm_eval_pit) <- c("gamlss1","gamlss2")
+# names(sm_eval_pit) <- c("gamlss1","gamlss2")
+names(sm_eval_pit) <- c("Simple","Full")
 sm_eval_pit <- rbindlist(sm_eval_pit,idcol = "model_id")
 
 
@@ -545,7 +562,11 @@ boot_dt <- eval_boot(melted_evaldt = boot_data,
 boot_dt[,aggregation:=factor(aggregation,levels = c("ps","ss","fdr"))]
 
 # bootstrap skill scores
-p1 <- boot_dt[model_id=="gamlss2",ggplot(data=.SD, aes(x=id,y=score)) 
+boot_dt[model_id=="gamlss1",model_id:="Simple"]
+boot_dt[model_id=="gamlss2",model_id:="Full"]
+boot_dt[kfold=="All_cv",kfold:="All CV"]
+
+p1 <- boot_dt[model_id=="Full",ggplot(data=.SD, aes(x=id,y=score)) 
               +labs(y = "CRPS skill score [%]", x = "Node")
               +geom_boxplot(outlier.size = .1)
               +coord_flip()
@@ -555,7 +576,8 @@ p1 <- boot_dt[model_id=="gamlss2",ggplot(data=.SD, aes(x=id,y=score))
               +theme_bw()
               +theme(legend.position="top",
                      text=element_text(family="serif",size=8),
-                     strip.background =element_rect(fill="white"))]
+                     strip.background =element_rect(fill="white"),
+                     axis.text.y = element_blank())]
 ggsave(paste0(plot_save,"boot_peaki_agg.pdf"),plot = p1, width=90,height=120,units = "mm")
 # save_plot(p1,name = "boot_peaki_agg")
 
@@ -576,7 +598,11 @@ pit_data[kfold!="Test",kfold:="All CV"]
 
 temp <- pit_data[,as.list(quick_hist(pit, breaks=20)),by=.(aggregation,kfold,model_id)]
 temp[,aggregation:=factor(aggregation,levels = c("ps","ss","fdr"))]
+
 # watch y limits are slightly larger here..
+temp[model_id=="gamlss1",model_id:="Simple"]
+temp[model_id=="gamlss2",model_id:="Full"]
+
 p1 <- ggplot(data=temp, aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)) +
   labs(y = "Density [-]", x = "Probability level [-]") + ylim(0,2)+
   geom_rect(fill = "grey75",color = "white")+
@@ -591,7 +617,7 @@ ggsave(paste0(plot_save,"pit_peaki_agg.pdf"),plot = p1, width=90,height=60,units
 
 
 ########################################################################
-### Results: Peak Timing
+### Results: Peak Timing ####
 ########################################################################
 
 # let's clear the workspace
@@ -634,7 +660,8 @@ p1 <- boot_dt[model_id=="gam",ggplot(data=.SD, aes(x=id,y=score))
               +theme_bw()
               +theme(legend.position="top",
                      text=element_text(family="serif",size=8),
-                     strip.background =element_rect(fill="white"))]
+                     strip.background =element_rect(fill="white"),
+                     axis.text.y = element_blank())]
 ggsave(paste0(plot_save,"boot_peakt_agg.pdf"),plot = p1, width=90,height=120,units = "mm")
 # save_plot(p1,name = "boot_peakt_agg")
 
@@ -651,6 +678,8 @@ boot_dt <- eval_boot(melted_evaldt = boot_data,
                      skillscore_b = "clim")
 
 # skill scores bootstraps
+boot_dt[model_id=="clim",model_id:="Benchmark"]
+boot_dt[model_id=="gam",model_id:="Hazard"]
 p1 <- boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) 
               +labs(y = "RPS skill score [%]", x = "Model")
               +geom_boxplot()
@@ -686,7 +715,7 @@ ggsave(paste0(plot_save,"dens_peakt_sm.pdf"),plot = p1, width=90,height=60,units
 
 
 ########################################################################
-### Results: Forecast Fusion
+### Results: Forecast Fusion ####
 ########################################################################
 
 
@@ -734,6 +763,10 @@ boot_dt[,aggregation:=factor(aggregation,levels = c("ps","ss","fdr"))]
 
 
 # bootstrap skill scores
+boot_dt[model_id=="gamlss1",model_id:="Simple"]
+boot_dt[model_id=="gamlss2",model_id:="Full"]
+boot_dt[model_id=="fusion",model_id:="Fusion"]
+
 p1 <- boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) 
               +labs(y = "CRPS skill score [%]", x = "Model")
               +geom_boxplot()
@@ -765,7 +798,8 @@ p1 <- boot_dt[model_id=="fusion",ggplot(data=.SD, aes(x=id,y=score))
               +theme_bw()
               +theme(legend.position="top",
                      text=element_text(family="serif",size=8),
-                     strip.background =element_rect(fill="white"))]
+                     strip.background =element_rect(fill="white"),
+                     axis.text.y = element_blank())]
 ggsave(paste0(plot_save,"boot_hh_aggid.pdf"),plot = p1, width=90,height=120,units = "mm")
 # p1 <- save_plot(p1,name = "boot_hh_aggid")
 
@@ -783,6 +817,10 @@ boot_dt[,aggregation:=factor(aggregation,levels = c("ps","ss","fdr"))]
 
 
 # bootstrap skill scores during peaks
+boot_dt[model_id=="gamlss1",model_id:="Simple"]
+boot_dt[model_id=="gamlss2",model_id:="Full"]
+boot_dt[model_id=="fusion",model_id:="Fusion"]
+
 p1 <- boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) 
               +labs(y = "CRPS skill score [%]", x = "Model")
               +geom_boxplot()
@@ -805,7 +843,11 @@ boot_dt <- eval_boot(melted_evaldt = boot_data,
 
 boot_dt[,aggregation:=factor(aggregation,levels = c("ps","ss","fdr"))]
 
-p1 <- boot_dt[model_id=="fusion",ggplot(data=.SD, aes(x=id,y=score)) 
+boot_dt[model_id=="gamlss1",model_id:="Simple"]
+boot_dt[model_id=="gamlss2",model_id:="Full"]
+boot_dt[model_id=="fusion",model_id:="Fusion"]
+
+p1 <- boot_dt[model_id=="Fusion",ggplot(data=.SD, aes(x=id,y=score)) 
               +labs(y = "CRPS skill score [%]", x = "Node")
               +geom_boxplot(outlier.size = .1)
               +coord_flip()
@@ -815,7 +857,8 @@ p1 <- boot_dt[model_id=="fusion",ggplot(data=.SD, aes(x=id,y=score))
               +theme_bw()
               +theme(legend.position="top",
                      text=element_text(family="serif",size=8),
-                     strip.background =element_rect(fill="white"))]
+                     strip.background =element_rect(fill="white"),
+                     axis.text.y = element_blank())]
 ggsave(paste0(plot_save,"boot_hhpk_aggid.pdf"),plot = p1, width=90,height=120,units = "mm")
 # save_plot(p1,name = "boot_hhpk_aggid")
 
@@ -835,15 +878,17 @@ hh_agg_eval_pit <- lapply(names(hh_agg_models),function(x){
   
   
 })
-names(hh_agg_eval_pit) <- c("gamlss1","gamlss2","fusion")
+# names(hh_agg_eval_pit) <- c("gamlss1","gamlss2","fusion")
+names(hh_agg_eval_pit) <- c("Simple","Full","Fusion")
 hh_agg_eval_pit <- rbindlist(hh_agg_eval_pit,idcol = "model_id")
 
 temp <- hh_agg_eval_pit[,as.list(quick_hist(pit, breaks=20)),by=.(aggregation,kfold,model_id)]
 temp[,aggregation:=factor(aggregation,levels = c("ps","ss","fdr"))]
-temp[,model_id:=factor(model_id,levels = c("gamlss1","gamlss2","fusion"))]
+# temp[,model_id:=factor(model_id,levels = c("gamlss1","gamlss2","fusion"))]
+temp[,model_id:=factor(model_id,levels = c("Simple","Full","Fusion"))]
 temp[kfold=="All_cv",kfold:="All CV"]
 
-p1 <- ggplot(data=temp[model_id!="gamlss1"], aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)) +
+p1 <- ggplot(data=temp[model_id!="Simple"], aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)) +
   labs(y = "Density [-]", x = "Probability level [-]") + ylim(0,1.55)+
   geom_rect(fill = "grey75",color = "white")+
   geom_hline(yintercept = 1,colour = "red", linetype = "dashed")+
@@ -860,7 +905,7 @@ rm(boot_data,boot_dt,hh_agg_models,hh_agg_eval,hh_agg_eval_pit,hh_agg_eval_rel,t
 
 
 #####################
-### SM level
+### SM level ####
 #####################
 
 # let's clear the workspace
