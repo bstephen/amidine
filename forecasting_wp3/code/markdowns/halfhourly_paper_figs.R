@@ -1,3 +1,5 @@
+## Preamble ####
+
 # options(repos='http://cran.rstudio.com/') ##restart?
 
 packages <- c("rmarkdown","cli","data.table","ggplot2","mgcv",
@@ -8,11 +10,16 @@ install.packages(setdiff(packages, rownames(installed.packages())))
 
 setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
 
-rm(list=ls())
-
 library(data.table)
 library(ggplot2)
 library(ProbCast)
+
+
+
+## Start ####
+
+rm(list=ls())
+
 
 
 data_save <- "../../saved_data/"
@@ -892,6 +899,7 @@ p1 <- ggplot(data=temp[model_id!="Simple"], aes(xmin=xmin, xmax=xmax, ymin=ymin,
   labs(y = "Density [-]", x = "Probability level [-]") + ylim(0,1.55)+
   geom_rect(fill = "grey75",color = "white")+
   geom_hline(yintercept = 1,colour = "red", linetype = "dashed")+
+  scale_x_continuous(breaks = c(0,0.5,1)) +
   facet_grid(aggregation~kfold+model_id)+
   theme_bw() +
   theme(legend.position="top",
@@ -967,6 +975,12 @@ boot_dt <- eval_boot(melted_evaldt = boot_data,
 
 
 # skill scores bootstraps
+boot_dt[model_id=="kde1",model_id:="KDE1"]
+boot_dt[model_id=="kde2",model_id:="KDE2"]
+boot_dt[model_id=="gamlss1",model_id:="Simple"]
+boot_dt[model_id=="gamlss2",model_id:="Full"]
+boot_dt[model_id=="fusion",model_id:="Fusion"]
+
 p1 <- boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) 
               +labs(y = "CRPS skill score [%]", x = "Model")
               +geom_boxplot()
@@ -987,7 +1001,13 @@ temp <- temp[,lapply(.SD,function(x){(1-(x/kde1))*100}),
 temp <- melt(temp,id.vars = c("id","kfold"))
 
 # skill score density
-p1 <- ggplot(data=temp[variable!="kde1"],aes(x = value, y = ..density..))+
+temp[variable=="kde1",variable:="KDE1"]
+temp[variable=="kde2",variable:="KDE2"]
+temp[variable=="gamlss1",variable:="Simple"]
+temp[variable=="gamlss2",variable:="Full"]
+temp[variable=="fusion",variable:="Fusion"]
+
+p1 <- ggplot(data=temp[variable!="KDE1"],aes(x = value, y = ..density..))+
   geom_histogram(binwidth = 1,fill = "grey50")+
   facet_grid(kfold~variable)+
   labs(x = "CRPS skill score [%]", y = "Density [-]")+
@@ -1022,11 +1042,12 @@ boot_data <- boot_data[lcl_data[aggregation=="sm",.(id,date_time,peak_ind)],on=.
 boot_data <- boot_data[peak_ind==1]
 boot_data[,peak_ind:=NULL]
 
+setnames(boot_data,old = c("kde1","kde2","gamlss1","gamlss2","fusion"),new=c("KDE1","KDE2","Simple","Full","Fusion"))
 
 boot_dt <- eval_boot(melted_evaldt = boot_data,
                      by_cols = c("aggregation","kfold"),
                      eval_cols = colnames(boot_data)[-c(1:4)],
-                     skillscore_b = "kde1")
+                     skillscore_b = "KDE1")
 
 
 # bootstrap skill scores during peaks
@@ -1045,17 +1066,17 @@ ggsave(paste0(plot_save,"boot_hhpk_sm.pdf"),plot = p1, width=90,height=60,units 
 
 
 temp <- boot_data[,lapply(.SD,mean),by=.(id,kfold),.SDcols = colnames(boot_data)[-c(1:4)]]
-temp <- temp[,lapply(.SD,function(x){(1-(x/kde1))*100}),
+temp <- temp[,lapply(.SD,function(x){(1-(x/KDE1))*100}),
              .SDcols=3:ncol(temp),keyby=.(id,kfold)]
 temp <- melt(temp,id.vars = c("id","kfold"))
 
 # skill score density during peaks
-p1 <- ggplot(data=temp[variable!="kde1"],aes(x = value, y = ..density..))+
+p1 <- ggplot(data=temp[variable!="KDE1"],aes(x = value, y = ..density..))+
   geom_histogram(binwidth = 1,fill = "grey50")+
   facet_grid(kfold~variable)+
   labs(x = "CRPS skill score [%]", y = "Density [-]")+
   geom_vline(xintercept = 0,colour = "red", linetype = "dashed") +
-  xlim(c(-30,30))+
+  xlim(c(-30,40))+
   theme_bw() + 
   theme(legend.position="top",
         text=element_text(family="serif",size=8),
@@ -1085,7 +1106,7 @@ hh_sm_eval_pit <- lapply(c("m7","blend"),function(x){
   
   
 })
-names(hh_sm_eval_pit) <- c("gamlss2","fusion")
+names(hh_sm_eval_pit) <- c("Full","Fusion")
 hh_sm_eval_pit <- rbindlist(hh_sm_eval_pit,idcol = "model_id")
 
 temp <- hh_sm_eval_pit[,as.list(quick_hist(pit, breaks=20)),by=.(aggregation,kfold,model_id)]
@@ -1105,9 +1126,61 @@ ggsave(paste0(plot_save,"pit_hh_sm.pdf"),plot = p1,width=90,height=60,units = "m
 # save_plot(p1,name = "pit_hh_sm")
 
 
+##################################
+## Skill vs Charateristics ####
+##################################
+
+rm(list=ls())
+
+data_save <- "../../saved_data/"
+plot_save <- "../../outputs/paper_plots/"
+
+# include utility functions
+source("../utils/amidine_utils.R")
+
+### now let's load the data from the data exploration and preparation document
+load(paste0(data_save,"prep_expl_smfc_outv2.rda"))
+
+## lagged values and omit so we have the same coverage of our forecasts
+lcl_data[,demand_l1d:=shift(demand,n=48L),by=.(id)]
+lcl_data[,demand_l7d:=shift(demand,n=48*7),by=.(id)]
+lcl_data <- na.omit(lcl_data)
 
 
+lcl_data[,kfold:=paste0("fold",ceiling(as.integer(format(date_uk,"%d"))/10))]
+lcl_data[kfold=="fold4",kfold:="fold1"]
+lcl_data[kfold=="fold3",kfold:="Test"]
 
+# now load the fusion results 
+load(paste0(data_save,"halfhourly_mixture_smfc_out.rda"))
+lcl_data[kfold!="Test",kfold:="All_cv"]
+
+ss_summary <-lcl_data[,.(mean_d=mean(demand), sd_d=sd(demand)),keyby=.(aggregation,id, kfold)]
+agg_test <- ss_summary[hh_agg_eval$blend[,.(crps=mean(crps)),by=.(aggregation, id, kfold)], on =.(aggregation, id, kfold)]
+agg_test <-agg_test[hh_agg_eval$bench[,.(crps_b=mean(crps)),by=.(aggregation, id, kfold)], on =.(aggregation, id, kfold)]
+
+sm_test <- ss_summary[hh_sm_eval$blend[,.(crps=mean(crps)),by=.(aggregation, id, kfold)], on =.(aggregation, id, kfold)]
+sm_test <-sm_test[hh_sm_eval$bench_tod[,.(crps_b=mean(crps)),by=.(aggregation, id, kfold)], on =.(aggregation, id, kfold)]
+
+all_test <- rbind(sm_test,agg_test)
+all_test[, ss:= (1-(crps/crps_b))*100]
+all_test[aggregation=="sm",agg_sm:="Household"]
+all_test[aggregation!="sm",agg_sm:="Aggregation"]
+
+
+# save(all_test,file="../../outputs/paper_plots/temp_data.Rda")
+# load(file="../../outputs/paper_plots/temp_data.Rda")
+
+ggplot(data=all_test[kfold=="Test"], aes(x = sd_d/mean_d, y = ss,color=aggregation)) +
+  labs(x = "Coefficient of Variation [-]", y = "CRPS Skill Score [-]") +
+  # geom_hline(yintercept = 1,colour = "red", linetype = "dashed")+
+   # geom_rect(fill = "grey75",color = "white")+
+  facet_grid(~agg_sm,scales = "free_x")+
+  theme_bw() + 
+  geom_point()
+  # theme(legend.position="top",
+  #       text=element_text(family="serif",size=8),
+  #       strip.background =element_rect(fill="white"))
 
 
 
