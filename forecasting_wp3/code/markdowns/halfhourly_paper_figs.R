@@ -1171,17 +1171,26 @@ all_test[aggregation!="sm",agg_sm:="Aggregation"]
 # save(all_test,file="../../outputs/paper_plots/temp_data.Rda")
 # load(file="../../outputs/paper_plots/temp_data.Rda")
 
-ggplot(data=all_test[kfold=="Test"], aes(x = sd_d/mean_d, y = ss,color=aggregation)) +
+
+all_test[aggregation=="sm",Aggregation:="Household"]
+all_test[aggregation=="fdr",Aggregation:="Feeder"]
+all_test[aggregation=="ps",Aggregation:="Primary"]
+all_test[aggregation=="ss",Aggregation:="Secondary"]
+
+p1 <- ggplot(data=all_test[kfold=="Test"], aes(x = sd_d/mean_d, y = ss,color=Aggregation,shape=Aggregation)) +
   labs(x = "Coefficient of Variation [-]", y = "CRPS Skill Score [-]") +
   # geom_hline(yintercept = 1,colour = "red", linetype = "dashed")+
    # geom_rect(fill = "grey75",color = "white")+
+  geom_point()+
+  ylim(c(-10,25))+
   facet_grid(~agg_sm,scales = "free_x")+
   theme_bw() + 
-  geom_point()
-  # theme(legend.position="top",
-  #       text=element_text(family="serif",size=8),
-  #       strip.background =element_rect(fill="white"))
-
+  theme(legend.position="top",
+        text=element_text(family="serif",size=8),
+        strip.background =element_rect(fill="white"))
+  
+p1
+ggsave(paste0(plot_save,"Skill_vs_Variation.pdf"),plot = p1,width=90,height=60,units = "mm")
 
 
 
