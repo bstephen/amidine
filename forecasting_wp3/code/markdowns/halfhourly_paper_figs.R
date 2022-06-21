@@ -1181,7 +1181,7 @@ p1 <- ggplot(data=all_test[kfold=="Test"], aes(x = sd_d/mean_d, y = ss,color=Agg
   labs(x = "Coefficient of Variation [-]", y = "CRPS Skill Score [-]") +
   # geom_hline(yintercept = 1,colour = "red", linetype = "dashed")+
    # geom_rect(fill = "grey75",color = "white")+
-  geom_point()+
+  geom_point(size=0.5)+
   ylim(c(-10,25))+
   facet_grid(~agg_sm,scales = "free_x")+
   theme_bw() + 
@@ -1190,7 +1190,7 @@ p1 <- ggplot(data=all_test[kfold=="Test"], aes(x = sd_d/mean_d, y = ss,color=Agg
         strip.background =element_rect(fill="white"))
   
 p1
-ggsave(paste0(plot_save,"Skill_vs_Variation.pdf"),plot = p1,width=90,height=60,units = "mm")
+ggsave(paste0(plot_save,"../../outputs/paper_plots/Skill_vs_Variation.pdf"),plot = p1,width=90,height=60,units = "mm")
 
 
 
