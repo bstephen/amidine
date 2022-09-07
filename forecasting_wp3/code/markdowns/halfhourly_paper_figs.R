@@ -52,7 +52,7 @@ load(paste0(data_save,"prep_expl_smfc_outv2.rda"))
 set.seed(1)
 wk <- lcl_data[,sample(woy_uk,1)]
 tmp_plot <- list()
-for(i in c(1,10,100,1000)){
+for(i in c(1,10,100,500,1000)){
   
   ids <- lcl_data[aggregation=="sm",sample(id,size = i)]
   
@@ -65,7 +65,7 @@ for(i in c(1,10,100,1000)){
 tmp_plot <- rbindlist(tmp_plot,idcol = "aggregation")
 # tmp_plot[,aggregation:=sprintf("%04d",as.numeric(aggregation))]
 
-p1 <- ggplot(data=tmp_plot,aes(x=date_time,y=av_demand))+
+p1 <- ggplot(data=tmp_plot[aggregation!=500,],aes(x=date_time,y=av_demand))+
   labs(y = "Average demand [kWh]", x = "Date/Time [dd/mm]")+
   scale_x_datetime(date_breaks = "1 day",date_labels = "%d/%m")+
   geom_line(colour="steelblue")+
@@ -77,11 +77,21 @@ p1 <- ggplot(data=tmp_plot,aes(x=date_time,y=av_demand))+
 # save_plot(p1,name = "sm_agg_intro")
 ggsave(paste0(plot_save,"sm_agg_intro.pdf"),plot = p1, width=180,height=120,units = "mm")
 ggsave(paste0(plot_save,"sm_agg_intro_small.pdf"),plot = p1, width=90,height=60,units = "mm")
+
+
+p2 <- ggplot(data=tmp_plot[aggregation%in%c(1,10,1000),],aes(x=date_time,y=av_demand,color=aggregation,linetype=aggregation))+
+  labs(y = "Average demand [kWh]", x = "Date/Time [dd/mm]")+
+  scale_x_datetime(date_breaks = "1 day",date_labels = "%d/%m")+
+  geom_line()+
+  # facet_wrap(~aggregation,nrow=2) + 
+  theme_bw() +
+  theme(text=element_text(family="serif",size=8),strip.background =element_rect(fill="white"),
+        legend.position="top") +
+  guides(color=guide_legend(title="Number of Households"),linetype=guide_legend(title="Number of Households"))
+
+ggsave(paste0(plot_save,"sm_agg_intro_v2.pdf"),plot = p2, width=90,height=100,units = "mm")
+
 rm(tmp_plot,wk)
-
-
-
-
 
 
 ########################################################################
@@ -257,7 +267,13 @@ ggsave(paste0(plot_save,"peak_lag.pdf"),plot = p1, width=90,height=60,units = "m
 
 rm(p1)
 
-
+ggplot(data=rbind(pklcl_data[aggregation_plot!="Households",],pklcl_data[aggregation_plot=="Households",][sample(1:.N,size = 2e4)]),
+       aes(y=demand,x=demandpk_l1,shape=aggregation_plot,color=aggregation_plot))+
+  labs(y = "Dialy peak demand [kWh]",x = "Daily peak demand lag 1 [kWh]")+
+  geom_point(size=0.1)+
+  # facet_wrap(~aggregation_plot,nrow=2,scales = "free")  + 
+  theme_bw() +
+  theme(text=element_text(family="serif",size=8),strip.background =element_rect(fill="white"))
 
 # sample_ids <- c("ps1","ss1","ss1_fdr1","N1174")
 # date_oi  <- as.POSIXct("2013-10-17", tz = "Europe/London")
@@ -377,7 +393,7 @@ p1 <- ggplot(data=prob_fc,aes(x=tod_uk,y=prob))+
   labs(y = "Probability of daily peak [-]", x = "Time of day [h]")+
   geom_vline(data = prob_fc[tod_uk==meas],aes(xintercept = meas),col = "red",lty = 2)+
   geom_segment(aes(x=tod_uk,xend=tod_uk,y=0,yend=prob),colour="grey70")+
-  geom_point(colour="steelblue")+
+  geom_point(colour="steelblue",size=0.5)+
   facet_wrap(~id_plot2,nrow=2) + 
   theme_bw() +
   theme(text=element_text(family="serif",size=8),strip.background =element_rect(fill="white"))
@@ -1158,18 +1174,18 @@ lcl_data[kfold!="Test",kfold:="All_cv"]
 ss_summary <-lcl_data[,.(mean_d=mean(demand), sd_d=sd(demand)),keyby=.(aggregation,id, kfold)]
 agg_test <- ss_summary[hh_agg_eval$blend[,.(crps=mean(crps)),by=.(aggregation, id, kfold)], on =.(aggregation, id, kfold)]
 agg_test <-agg_test[hh_agg_eval$bench[,.(crps_b=mean(crps)),by=.(aggregation, id, kfold)], on =.(aggregation, id, kfold)]
+agg_test <-agg_test[hh_agg_eval$m8[,.(crps_b2=mean(crps)),by=.(aggregation, id, kfold)], on =.(aggregation, id, kfold)]
+
 
 sm_test <- ss_summary[hh_sm_eval$blend[,.(crps=mean(crps)),by=.(aggregation, id, kfold)], on =.(aggregation, id, kfold)]
 sm_test <-sm_test[hh_sm_eval$bench_tod[,.(crps_b=mean(crps)),by=.(aggregation, id, kfold)], on =.(aggregation, id, kfold)]
+sm_test <-sm_test[hh_sm_eval$m7[,.(crps_b2=mean(crps)),by=.(aggregation, id, kfold)], on =.(aggregation, id, kfold)]
 
 all_test <- rbind(sm_test,agg_test)
 all_test[, ss:= (1-(crps/crps_b))*100]
+all_test[, ss2:= (1-(crps/crps_b2))*100]
 all_test[aggregation=="sm",agg_sm:="Household"]
 all_test[aggregation!="sm",agg_sm:="Aggregation"]
-
-
-# save(all_test,file="../../outputs/paper_plots/temp_data.Rda")
-# load(file="../../outputs/paper_plots/temp_data.Rda")
 
 
 all_test[aggregation=="sm",Aggregation:="Household"]
@@ -1177,10 +1193,66 @@ all_test[aggregation=="fdr",Aggregation:="Feeder"]
 all_test[aggregation=="ps",Aggregation:="Primary"]
 all_test[aggregation=="ss",Aggregation:="Secondary"]
 
+
+## Now for peak hours...
+# boot_data <- boot_data[lcl_data[aggregation!="sm",.(id,date_time,peak_ind)],on=.(id,date_time)]
+# boot_data <- boot_data[peak_ind==1]
+# boot_data[,peak_ind:=NULL]
+
+
+ss_summary <-lcl_data[,.(mean_d=mean(demand), sd_d=sd(demand)),keyby=.(aggregation,id, kfold)]
+agg_test_peak <- ss_summary[
+  hh_agg_eval$blend[lcl_data[aggregation!="sm",.(id,date_time,peak_ind)],on=.(id,date_time)][peak_ind==1,.(crps=mean(crps)),,by=.(aggregation, id, kfold)],
+  on =.(aggregation, id, kfold)]
+agg_test_peak <-agg_test_peak[
+  hh_agg_eval$bench[lcl_data[aggregation!="sm",.(id,date_time,peak_ind)],on=.(id,date_time)][peak_ind==1,.(crps_b=mean(crps)),,by=.(aggregation, id, kfold)],
+  # hh_agg_eval$bench[,.(crps_b=mean(crps)),by=.(aggregation, id, kfold)],
+  on =.(aggregation, id, kfold)]
+agg_test_peak <-agg_test_peak[
+  hh_agg_eval$m8[lcl_data[aggregation!="sm",.(id,date_time,peak_ind)],on=.(id,date_time)][peak_ind==1,.(crps_b2=mean(crps)),,by=.(aggregation, id, kfold)],
+  # hh_agg_eval$m8[,.(crps_b2=mean(crps)),by=.(aggregation, id, kfold)],
+  on =.(aggregation, id, kfold)]
+
+
+sm_test_peak <- ss_summary[
+  hh_sm_eval$blend[lcl_data[aggregation=="sm",.(id,date_time,peak_ind)],on=.(id,date_time)][peak_ind==1,.(crps=mean(crps)),,by=.(aggregation, id, kfold)],
+  # hh_sm_eval$blend[,.(crps=mean(crps)),by=.(aggregation, id, kfold)],
+  on =.(aggregation, id, kfold)]
+sm_test_peak <-sm_test_peak[
+  hh_sm_eval$bench_tod[lcl_data[aggregation=="sm",.(id,date_time,peak_ind)],on=.(id,date_time)][peak_ind==1,.(crps_b=mean(crps)),,by=.(aggregation, id, kfold)],
+  # hh_sm_eval$bench_tod[,.(crps_b=mean(crps)),by=.(aggregation, id, kfold)],
+  on =.(aggregation, id, kfold)]
+sm_test_peak <-sm_test_peak[
+  hh_sm_eval$m7[lcl_data[aggregation=="sm",.(id,date_time,peak_ind)],on=.(id,date_time)][peak_ind==1,.(crps_b2=mean(crps)),,by=.(aggregation, id, kfold)],
+  # hh_sm_eval$m7[,.(crps_b2=mean(crps)),by=.(aggregation, id, kfold)],
+  on =.(aggregation, id, kfold)]
+
+
+all_test_peak <- rbind(agg_test_peak,sm_test_peak)
+all_test_peak[, ss:= (1-(crps/crps_b))*100]
+all_test_peak[, ss2:= (1-(crps/crps_b2))*100]
+all_test_peak[aggregation=="sm",agg_sm:="Household"]
+all_test_peak[aggregation!="sm",agg_sm:="Aggregation"]
+
+
+all_test_peak[aggregation=="sm",Aggregation:="Household"]
+all_test_peak[aggregation=="fdr",Aggregation:="Feeder"]
+all_test_peak[aggregation=="ps",Aggregation:="Primary"]
+all_test_peak[aggregation=="ss",Aggregation:="Secondary"]
+
+
+# save(all_test,all_test_peak,file="../../outputs/paper_plots/temp_data.Rda")
+# load(file="../../outputs/paper_plots/temp_data.Rda")
+
+
+
+all_test[kfold=="Test",mean(ss>0),by=aggregation]
+all_test_peak[kfold=="Test",mean(ss>0),by=aggregation]
+
 p1 <- ggplot(data=all_test[kfold=="Test"], aes(x = sd_d/mean_d, y = ss,color=Aggregation,shape=Aggregation)) +
   labs(x = "Coefficient of Variation [-]", y = "CRPS Skill Score [-]") +
   # geom_hline(yintercept = 1,colour = "red", linetype = "dashed")+
-   # geom_rect(fill = "grey75",color = "white")+
+  # geom_rect(fill = "grey75",color = "white")+
   geom_point(size=0.5)+
   ylim(c(-10,25))+
   facet_grid(~agg_sm,scales = "free_x")+
@@ -1188,9 +1260,38 @@ p1 <- ggplot(data=all_test[kfold=="Test"], aes(x = sd_d/mean_d, y = ss,color=Agg
   theme(legend.position="top",
         text=element_text(family="serif",size=8),
         strip.background =element_rect(fill="white"))
-  
+
 p1
 ggsave(paste0(plot_save,"../../outputs/paper_plots/Skill_vs_Variation.pdf"),plot = p1,width=90,height=60,units = "mm")
 
+
+
+p2 <- ggplot(data=all_test[kfold=="Test"], aes(x = sd_d/mean_d, y = ss2,color=Aggregation,shape=Aggregation)) +
+  labs(x = "Coefficient of Variation [-]", y = "CRPS Skill Score [-]") +
+  # geom_hline(yintercept = 1,colour = "red", linetype = "dashed")+
+  # geom_rect(fill = "grey75",color = "white")+
+  geom_point(size=0.5)+
+  ylim(c(-2,12))+
+  facet_grid(~agg_sm,scales = "free_x")+
+  theme_bw() + 
+  theme(legend.position="top",
+        text=element_text(family="serif",size=8),
+        strip.background =element_rect(fill="white"))
+
+p2
+ggsave(paste0(plot_save,"../../outputs/paper_plots/Skill_bestbench_vs_Variation.pdf"),plot = p2,width=90,height=60,units = "mm")
+
+
+
+
+
+require(xtable)
+table_data <- all_test[kfold=="Test",.(`Simple Benchmark`=mean(crps_b),`Advanced Benchmark`=mean(crps_b2),Fusion=mean(crps),Skill=mean(ss2)),by=Aggregation]
+table_data[,`All/Peak`:="All"]
+
+table_data_peak <- all_test_peak[kfold=="Test",.(`Simple Benchmark`=mean(crps_b),`Advanced Benchmark`=mean(crps_b2),Fusion=mean(crps),Skill=mean(ss2)),by=Aggregation]
+table_data_peak[,`All/Peak`:="Peak"]
+
+print(xtable(rbind(table_data,table_data_peak)[c(2:4,1,7:5,8),c(6,1:5)],digits = 2),include.rownames=FALSE)
 
 
