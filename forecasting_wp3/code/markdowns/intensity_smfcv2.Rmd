@@ -1,0 +1,2267 @@
+---
+title: "Amidine --- Residential Peak Demand Forecasting --- Peak Intensity Forecasting"
+output:
+  html_document:
+    code_folding: hide
+    theme: united
+    number_sections: true
+    toc: true
+---
+
+<style>
+.main-container {
+    max-width: 1200px !important;
+}
+pre {
+  overflow-x: auto
+}
+pre code {
+  word-wrap: normal;
+  white-space: pre;
+}
+</style>
+
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 800)
+```
+
+First some required packages and functions for plotting/importing data
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+# options(repos='http://cran.rstudio.com/') ##restart?
+
+packages <- c("rmarkdown","cli","data.table","ggplot2","gamlss.tr","pbapply")
+
+install.packages(setdiff(packages, rownames(installed.packages())))
+
+rm(list=ls())
+
+library(data.table)
+library(ggplot2)
+library(gamlss.tr)
+library(pbapply)
+
+
+data_save <- "../../saved_data/"
+
+# include utility functions
+source("../utils/amidine_utils.R")
+
+
+
+```
+
+Now let's load the data from the data exploration and preparation document
+
+
+```{r}
+
+load(paste0(data_save,"prep_expl_smfc_outv2.rda"))
+
+hier_ref
+
+
+```
+
+
+
+# probabilistic peak intensity load forecasting
+
+Let's just dive into doing some forecasting, we will start by chopping the data into 3 folds. We have 2 folds for cross validation and one for testing, obviously we don't have a very big dataset for estimation and evaluation. Therefore quantifying the uncertainty in evaluation metrics will be key.
+
+
+- we will divide each month into three fold chunks and take them as our folds, using the third chunk as our blind testing data
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+lcl_data[,kfold:=paste0("fold",ceiling(as.integer(format(date_uk,"%d"))/10))]
+lcl_data[kfold=="fold4",kfold:="fold1"]
+lcl_data[kfold=="fold3",kfold:="Test"]
+
+lcl_data
+
+
+```
+
+
+First, let's try some quick feature engineering. We will make some features based on
+
+- lagged peak load at 1 day at 7 days
+- lagged hour of peak at 1 day and 7 days, this is a categorical variable, morning <11am, afternoon 11am-4pm, evening 4pm-8pm, late evening 8pm-12am 
+- lagged variance of demand over the entire day
+- day-of-the-week feature where, weekdays/weekends are encoded by indicator variables (NB: it is not expected that this variable will be very helpful but is included for comparison to traditional load forecasting)
+- day-of-year variable to include seasonality
+- lagged variance of demand 3 hours around peak, not this is calc. on a centered window on per day basis and carried forward/backwards at the roll ends
+
+Here is a plot of the lagged daily variance feature
+
+- this is interesting, can see a real correlation between the peak level and the lagged daily variance of the demand
+- makes sense, if the ts is volatile yesterday then ---> volatile tomorrow
+- maybe log transformation at SM level would be useful
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+## lagged peak
+lcl_data[peak_ind==1,demandpk_l1:=shift(demand,n=1L),by=.(id)]
+lcl_data[peak_ind==1,demandpk_l7:=shift(demand,n=7L),by=.(id)]
+
+## lagged hour of peak
+lcl_data[peak_ind==1,hourpk:="morning"]
+lcl_data[peak_ind==1 & tod_uk>=11,hourpk:="afternoon"]
+lcl_data[peak_ind==1 & tod_uk>=16,hourpk:="evening"]
+lcl_data[peak_ind==1 & tod_uk>=20,hourpk:="late_evening"]
+
+# lcl_data[peak_ind==1,hourpk_l1:=shift(hourpk,n=1L),by=.(id)]
+# lcl_data[peak_ind==1,hourpk_l7:=shift(hourpk,n=7L),by=.(id)]
+
+
+lcl_data[peak_ind==1,hourpk_l1:=shift(tod_uk,n=1L),by=.(id)]
+lcl_data[peak_ind==1,hourpk_l7:=shift(tod_uk,n=7L),by=.(id)]
+
+
+## lagged daily variance
+lcl_data[,dvar_demand:=var(demand),by=.(date_uk,id)]
+lcl_data[peak_ind==1,dvar_demand_l1:=shift(dvar_demand,n=1L),by=.(id)]
+# lcl _data[peak_ind==1,dvar_demand_l7:=shift(dvar_demand,n=7L),by=.(id)]
+
+## weekday/weekend feature
+lcl_data[,dow_ftr:=1]
+lcl_data[dow_uk%in%c(1,7),dow_ftr:=0]
+
+## 3hour rolling demand, note that the window is centered at included 1.5h+ and 1.5h- and the data.point itself
+lcl_data[,h3var_demand:= frollapply(demand,n = (3/0.5)+1,align = "center",FUN = var),by=.(date_uk,id)]
+lcl_data[,h3var_demand := zoo::na.locf(h3var_demand,na.rm=F),by=.(date_uk,id)]
+lcl_data[,h3var_demand := zoo::na.locf(h3var_demand,na.rm=F,fromLast = T),by=.(date_uk,id)]
+
+lcl_data[peak_ind==1,h3var_demand_l1:=shift(h3var_demand,n=1L),by=.(id)]
+
+
+
+ggplot(data=lcl_data[peak_ind==1],aes(y=demand,x=dvar_demand_l1))+
+  labs(y = "peak demand [kWh]",x = "daily sd(demand) lag1 [kWh]")+
+  geom_point(aes(colour=hourpk_l1),size=0.1)+
+  facet_wrap(~aggregation,nrow=2,scales = "free")
+
+
+
+
+
+```
+
+
+- less so with the lagged 3 hour rolling window variance around the peak
+- hmmm
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+ggplot(data=lcl_data[peak_ind==1],aes(y=demand,x=h3var_demand_l1))+
+  labs(y = "peak demand [kWh]",x = "3hr window var(peak_demand) lag1 [kWh^2]")+
+  geom_point(colour="steelblue",size=0.1)+
+  facet_wrap(~aggregation,nrow=2,scales = "free")
+
+
+```
+
+Here's some plots with the lagged hour-of-peak feature
+
+- this looks like it might only help marginally if so.
+- it reminds us we need to remove the lagged NA values from the data though
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+ggplot(data=lcl_data[peak_ind==1],aes(y=demand,x=demandpk_l1))+
+  labs(y = "peak demand [kWh]",x = "peak demand lag1 [kWh]")+
+  geom_point(aes(colour=hourpk_l1),size=0.5)+
+  facet_wrap(~aggregation,nrow=2,scales = "free")
+
+
+
+```
+
+
+Now we only have 358 days and datapoints per series :!
+
+```{r}
+
+pklcl_data <- lcl_data[peak_ind==1 & doy_uk>7]
+
+
+pklcl_data
+
+
+```
+
+
+## aggregate forecasting - gamlss
+
+
+As shown in the plots previously, modelling the aggregate level peak demand will be quite different to forecasting at the SM level
+
+For the aggregate levels we will use generalized additive models for location, shape, and scale. This is motivated by
+
+- the smooth seasonal component of peak demand can be incorporated
+- the linear lagged terms can be easily incorporated
+- we have a flexible range of distributions to choose from
+- the mean, location, shape, and scale can be made conditional on exogenous variables, which means we can generate dynamic forecast distributions
+
+### benchmark gamlss
+
+To begin we will use a really simple AR model with constant variance
+
+- the input features here are simple the peak demand yesterday and 7 days ago
+- we have simple linear learner terms as well
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+agg_bench <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation!="sm"],
+                          vars = c("demand","demandpk_l1","demandpk_l7"),
+                          split_col = "id",
+                          sort_cols = "date_time",
+                          ncores = 3,
+                          ncores_inner = 3,
+                          formula = demand~demandpk_l1+demandpk_l7,
+                          sigma.formula = ~1,
+                          family = NO,
+                          method = mixed(10,20))
+
+
+sum(sapply(agg_bench,function(z){sum(sapply(z,function(x){x$converged}))==length(z)}))==length(agg_bench)
+
+```
+
+
+The reliability over the CV and testing set is shown
+- it seems we have v. good reliability characteristics
+- consider we only have 365 obs. for each group
+- this might be a tough benchmark to beat!
+- note there is larger probabilistic bias on the test dataset because we have a smaller sample size...
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+agg_bench_mqr <- ml_ppd2mqr(ppd_list = agg_bench,
+                           melted_dt = pklcl_data[aggregation!="sm"],
+                           split_col = "id",
+                           sort_cols = "date_time",
+                           params=FALSE,
+                           quantiles = seq(0.01, 0.99, by = 0.01))
+
+
+eval_agg <- list()
+
+
+
+eval_agg$rel <- ml_eval_mqr(mqr_list = agg_bench_mqr,
+                            metric = "rel",
+                            melted_dt = pklcl_data[aggregation!="sm"],
+                            obs_col = "demand",
+                            split_col = "id",
+                            sort_cols = "date_time",
+                            plot.it=FALSE)
+
+
+eval_agg$pball <- ml_eval_mqr(mqr_list = agg_bench_mqr,
+                            metric = "pball",
+                            melted_dt = pklcl_data[aggregation!="sm"],
+                            obs_col = "demand",
+                            split_col = "id",
+                            sort_cols = "date_time",
+                            plot.it=FALSE)
+
+
+eval_agg <- lapply(eval_agg,rbindlist,idcol="id")
+eval_agg <- lapply(eval_agg,function(x){x[,kfold:=as.character(kfold)]})
+eval_agg <- lapply(eval_agg, function(x){x[pklcl_data,aggregation:=aggregation,on=.(id)]})
+
+
+group.colors <- c(mean = "steelblue", id =alpha("grey50",0.5), ideal="black")
+
+ggplot(data=eval_agg$rel[kfold%in%c("All_cv","Test")],aes(x= Nominal)) + 
+  labs(y = "empirical coverage [-]", x = "nominal coverage [-]") + 
+  geom_line(aes(y=Empirical, group =  id, colour="id")) +
+  geom_point(aes(y=Empirical, group =  id,colour="id"), size = 1) +
+  geom_line(aes(x = Nominal, y=Empirical, colour = "mean"),
+            data = eval_agg$rel[kfold%in%c("All_cv","Test"),
+                                list(Empirical=mean(Empirical)),by=.(Nominal,kfold,aggregation)]) + 
+  geom_point(aes(x = Nominal, y=Empirical, colour = "mean"),
+             data = eval_agg$rel[kfold%in%c("All_cv","Test"),
+                                 list(Empirical=mean(Empirical)),by=.(Nominal,kfold,aggregation)]) +
+  geom_line(aes(y=Nominal, colour="ideal"), linetype = "dashed") + 
+  facet_grid(aggregation~kfold) + 
+  theme(legend.position="top") +
+  scale_colour_manual(name = NULL,values=group.colors,labels = c("individual ids","ideal","average"))+
+  guides(color = guide_legend(override.aes = list(linetype=c(1,2,1),shape = c(16,NA,16))))
+
+
+
+
+```
+
+And here is the pinball loss, note we could use Gaussian CRPS or something here, but just using pinball for quickness
+
+- note it's quite hard to compare between groups here because we're on different scales
+- generally, we can see that the CV results are similar to the testing
+- that indicates we're not over-fitting
+- taking the feeder level and .5 quantile, we can see that the average pinball loss is .6kWh
+- this translates to a MAE of 1.2kWh for that quantile, seems reasonable when the max demand in this group is 30kWh
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+group.colors <- c(mean = "steelblue", id =alpha("grey50",0.5))
+
+ggplot(data=eval_agg$pball[kfold%in%c("All_cv","Test")],aes(x= Quantile)) + 
+  labs(y = "pinball loss [kWh]", x = "quantile [-]") +
+  geom_line(aes(y=Loss, group =  id, color = "id")) +
+  geom_point(aes(y=Loss, group =  id, color = "id"), size = 1) +
+  geom_line(aes(x = Quantile, y=Loss, colour = "mean"),
+                       data = eval_agg$pball[kfold%in%c("All_cv","Test"),list(Loss=mean(Loss)),by=.(Quantile,kfold,aggregation)]) +
+  geom_point(aes(x = Quantile, y=Loss, colour = "mean"),
+                        data = eval_agg$pbal[kfold%in%c("All_cv","Test"),list(Loss=mean(Loss)),by=.(Quantile,kfold,aggregation)]) +
+  facet_grid(aggregation~kfold,scales= "free_y") +
+  scale_colour_manual(name = NULL,values=group.colors,labels = c("id","average"))+
+  theme(panel.spacing = unit(1, "lines"),legend.position = "top")
+
+
+
+
+```
+
+The pits are obv a bit all over the place, we don't have enough data to properly evaluate this way on an individal level...
+
+
+```{r fig.height=15,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+eval_agg$pit <- ml_PIT(ppd_list = agg_bench,
+                       melted_dt = pklcl_data[aggregation!="sm"],
+                       split_col = "id",
+                       sort_cols = "date_time")
+
+
+invisible(lapply(names(eval_agg$pit),function(x){
+  
+  pklcl_data[id==x,pit_b:=eval_agg$pit[[x]]]
+  
+  
+}))
+
+
+group.colors <- c(mean = "steelblue", id =alpha("grey50",0.5), ideal="black")
+pklcl_data[aggregation!="sm",ggplot(data=.SD, aes(x=pit_b)) + labs(y = "density [-]", x = " probability level")
+        +geom_histogram(aes(y=after_stat(density)), fill = "grey75", color = "white", boundary=1, binwidth = 0.05)
+        +geom_hline(aes(yintercept = 1,colour = "ideal"), linetype = "dashed")
+        +scale_colour_manual(name = NULL,values=group.colors)
+        +facet_wrap(~id,ncol=3)
+        +theme(legend.position="top")]
+
+
+
+
+```
+
+
+
+### advanced gamlss --- m1
+
+We will expand on the previous model by
+
+- including conditional variance dependent on the lag1 demand
+- we will include a DOY variable for the mean
+- we will include doy as a smooth spline, unfortunately the gamlss spline learner doesn't account for cyclical data very well, you can't specify the boundaries, it interprets the boundaries from the data, which means in kfold analysis it's no good..
+
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+agg_m1 <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation!="sm"],
+                       vars = c("demand","demandpk_l1","demandpk_l7","doy_uk"),
+                       split_col = "id",
+                       sort_cols = "date_time",
+                       ncores = 3,
+                       ncores_inner = 3,
+                       formula = demand~ demandpk_l1+demandpk_l7+pb(doy_uk,control = pb.control(inter = 12)),
+                       sigma.formula = ~ demandpk_l1,
+                       family = NO,
+                       method = mixed(10,20))
+
+
+sum(sapply(agg_m1,function(z){sum(sapply(z,function(x){x$converged}))==length(z)}))==length(agg_m1)
+
+
+
+```
+
+let's have a look at the model fit for three locations
+
+- we're plotting the effect of the lagged demand and doy on the mean prediction
+- the model fit looks like how I intended...so that's good
+
+- note including splines for the lagged demand (1) doesn't improve the results (not shown)
+- note including splines for the DOY for the scale values doesn't improve the results (not shown)
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+# set.seed(1)
+# sample_ids <- pklcl_data[aggregation!="sm",sample(unique(id),3)]
+sample_ids <- c("ps1","ss4","ss2_fdr3")
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+par(mfrow=c(3,3))
+for(i in sample_ids){
+tempdata <- pklcl_data[id==i & kfold!="Test"]
+fold <- "Test"
+term.plot(agg_m1[[i]]$Test,what = "mu",rug = TRUE,ask = FALSE,data = tempdata,ylim = "free",main=i,cex.lab=.9)
+}
+
+
+
+```
+
+
+Here we will calculate the CRPS, calculate bootstrap average skill scores, and separate the performance into the three levels of the hierarchy considered so far
+
+- we use the sample version of CRPS so we can use the function more flexibly
+- the results show that we have improved the model significantly at the feeder level and secondary substation
+- the improvement is less obvious at the primary substation level (`ps`)
+- at both substation levels the test performance of the second model isn't great
+<!-- - I think this has to do with using the lagged demand for the variance term, which is the major change in the model -->
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+### benchmark
+eval_agg$crps <- rbindlist(ml_crps_mqr(mqr_list = agg_bench_mqr,
+                           melted_dt = pklcl_data[aggregation!="sm"],
+                           method="kde",
+                           mod_name = "bench",
+                           sort_cols = c("date_uk","aggregation")),idcol = "id")
+
+eval_agg$crps[kfold!="Test",kfold:="All_cv"]
+
+
+
+agg_m1_mqr <- ml_ppd2mqr(ppd_list = agg_m1,
+                           melted_dt = pklcl_data[aggregation!="sm"],
+                           split_col = "id",
+                           sort_cols = "date_time",
+                           params=FALSE,
+                           quantiles = seq(0.01, 0.99, by = 0.01))
+
+
+eval_agg$m1_crps <- rbindlist(ml_crps_mqr(mqr_list = agg_m1_mqr,
+                               melted_dt = pklcl_data[aggregation!="sm"],
+                               method="kde",
+                               mod_name = "m1",
+                               sort_cols = c("date_uk","aggregation")),idcol = "id")
+
+eval_agg$m1_crps[kfold!="Test",kfold:="All_cv"]
+
+
+boot_dt <- eval_boot(melted_evaldt = cbind(eval_agg$crps,eval_agg$m1_crps[,.(m1)]),
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = c("bench","m1"),
+                     skillscore_b = "bench")
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold)
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+```
+
+Here is the bootstrap score improvements at the individual ID levels considered so far
+
+- for some reason at certain IDS there seem to be some decrease in skill over the test dataset especially, e.g. at  `ss4`
+- overall the conditional heteroskedasticity improves the model significantly on average, especially at the feeder level
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+imp_dt <- eval_boot(melted_evaldt = cbind(eval_agg$crps,eval_agg$m1_crps[,.(m1)]),
+                    by_cols = c("aggregation","id","kfold"),
+                    eval_cols = c("bench","m1"),
+                    skillscore_b = "bench")
+
+
+imp_dt[model_id!="bench",ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(aggregation~kfold,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+### advanced gamlss - m2
+
+
+Here's another model set-up
+
+- replaced the lagged load as a predictor for the variance of the guassian with the lagged (1) daily std. dev of demand
+- also included this variable as a predictor for the mean
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+agg_m2 <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation!="sm"],
+                       vars = c("demand","demandpk_l1","demandpk_l7","doy_uk","dvar_demand_l1"),
+                       split_col = "id",
+                       sort_cols = "date_time",
+                       ncores = 3,
+                       ncores_inner = 3,
+                       formula = demand~ demandpk_l1+demandpk_l7+pb(doy_uk,control = pb.control(inter = 12))+sqrt(dvar_demand_l1),
+                       sigma.formula = ~ sqrt(dvar_demand_l1),
+                       family = NO,
+                       method = mixed(10,20))
+
+
+sum(sapply(agg_m2,function(z){sum(sapply(z,function(x){x$converged}))==length(z)}))==length(agg_m2)
+
+
+
+```
+
+
+We will cut straight to the CRPS bootstrapped evaluation
+
+- seems to work well especially at the `ss` level
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+agg_m2_mqr <- ml_ppd2mqr(ppd_list = agg_m2,
+                           melted_dt = pklcl_data[aggregation!="sm"],
+                           split_col = "id",
+                           sort_cols = "date_time",
+                           params=FALSE,
+                           quantiles = seq(0.01, 0.99, by = 0.01))
+
+
+
+eval_agg$m2_crps <- rbindlist(ml_crps_mqr(mqr_list = agg_m2_mqr,
+                               melted_dt = pklcl_data[aggregation!="sm"],
+                               method="kde",
+                               mod_name = "m2",
+                               sort_cols = c("date_uk","aggregation")),idcol = "id")
+
+eval_agg$m2_crps[kfold!="Test",kfold:="All_cv"]
+
+
+boot_dt <- eval_boot(melted_evaldt = cbind(eval_agg$crps,eval_agg$m1_crps[,.(m1)],
+                                           eval_agg$m2_crps[,.(m2)]),
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = c("bench","m1","m2"),
+                     skillscore_b = "bench")
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales="free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+Here is the bootstrap improvement of CRPS in `m2` over `m1`
+
+- we can see that we may have degraded the skill marginally at the feeder level during cross_validation
+- decent improvement at the two substation levels
+- at the feeder level the performance on the test dataset is better
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+imp_dt <- eval_boot(melted_evaldt = cbind(eval_agg$m1_crps,eval_agg$m2_crps[,.(m2)]),
+                    by_cols = c("aggregation","id","kfold"),
+                    eval_cols = c("m1","m2"),
+                    skillscore_b = "m1")
+
+
+imp_dt[model_id!="m1",ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement over m1 [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(aggregation~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+```
+
+### advanaced gamlss - m3
+
+Here is a third  model for the aggregate levels
+
+- we have added the d.o.w. feature where 0 is the weekend and 1 is the weekday
+- this was added as levels in both the mean and variance
+- we have reduced the degree of the polynomials in the DOY spline (it seems to be overfitting), as shown in the partial effect plots previously
+
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+pklcl_data[,dow_ftr := factor(dow_ftr)]
+
+agg_m3 <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation!="sm"],
+                       vars = c("demand","demandpk_l1","demandpk_l7","doy_uk","dvar_demand_l1","dow_ftr"),
+                       split_col = "id",
+                       sort_cols = "date_time",
+                       ncores = 3,
+                       ncores_inner = 3,
+                       formula = demand~ demandpk_l1+demandpk_l7+pb(doy_uk,control = pb.control(inter = 12),df=4)+sqrt(dvar_demand_l1)+dow_ftr,
+                       sigma.formula = ~ sqrt(dvar_demand_l1)+dow_ftr,
+                       family = NO,
+                       method = mixed(10,20))
+
+
+sum(sapply(agg_m3,function(z){sum(sapply(z,function(x){x$converged}))==length(z)}))==length(agg_m3)
+
+
+
+```
+
+
+Again we go straight to the bootstrapped CRPS comparison at the different levels of the hierarchy
+
+- these two changes seems to improve things on average at all levels across the two datasets!
+
+
+-nb: lagged hour of peak doesn't seem to be useful, not enough levels at some kfolds for factors (not shown)
+-nb: the numeric version has little effect (not shown)
+-nb: random effect? find out what the hell that is (not shown)
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+agg_m3_mqr <- ml_ppd2mqr(ppd_list = agg_m3,
+                           melted_dt = pklcl_data[aggregation!="sm"],
+                           split_col = "id",
+                           sort_cols = "date_time",
+                           params=FALSE,
+                           quantiles = seq(0.01, 0.99, by = 0.01))
+
+
+eval_agg$m3_crps <- rbindlist(ml_crps_mqr(mqr_list = agg_m3_mqr,
+                               melted_dt = pklcl_data[aggregation!="sm"],
+                               method="kde",
+                               mod_name = "m3",
+                               sort_cols = c("date_uk","aggregation")),idcol = "id")
+
+eval_agg$m3_crps[kfold!="Test",kfold:="All_cv"]
+
+
+boot_dt <- eval_boot(melted_evaldt = cbind(eval_agg$crps,eval_agg$m1_crps[,.(m1)],eval_agg$m2_crps[,.(m2)],
+                                           eval_agg$m3_crps[,.(m3)]),
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = c("bench","m1","m2","m3"),
+                     skillscore_b = "bench")
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold, scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+```
+
+Here is the bootstrap CRPS improvement of `m3` over `m2`
+
+- sig. improvement at `ps` level, good!
+- like `m2` there seems to be some node-variation in the improvement... to do with the capacity of node or peak variability?
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+imp_dt <- eval_boot(melted_evaldt = cbind(eval_agg$crps,eval_agg$m1_crps[,.(m1)],
+                                          eval_agg$m2_crps[,.(m2)],eval_agg$m3_crps[,.(m3)]),
+                    by_cols = c("aggregation","id","kfold"),
+                    eval_cols = c("m2","m3"),
+                    skillscore_b = "m2")
+
+
+imp_dt[model_id=="m3",ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement against m2 [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(aggregation~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+Here is the partial effect plots for the `m3` model at different levels for the mean prediction on the test dataset
+
+- [`ss5`, `ss1`] and [`ss4_fdr2`, `ss4_fdr1`] are chosen for comparison because they are at opposite ends of the CRPS improvement scale during testing
+
+There are a number of interesting points here
+
+- at `ss1` the d.o.w feature isn't as clearly separated in it's influence on the demand, compared to `ss5`
+- this means that at `ss5` the peaks at weekday/weekends are significantly different
+- at `ss4_fdr1` the effect of the lagged variance of demand feature is strange, looks as if this feature should be shrunk to zero at this node
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+sample_ids <- c("ss5","ss1","ss4_fdr2","ss4_fdr1")
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+par(mfrow=c(4,5))
+for(i in sample_ids){
+tempdata <- pklcl_data[id==i & kfold!="Test"]
+fold <- "Test"
+term.plot(agg_m3[[i]]$Test,what = "mu",rug = TRUE,ask = FALSE,data = tempdata,ylim = "free",main=i,cex.lab=.9)
+
+}
+
+
+
+```
+
+And here is the same partial effect plots for the sigma parameter 
+
+- again the d.o.w feature only seems to be useful at certain nodes
+- there is a strange switch of partial effect of the `dow_ftr` at `ss4_fdr2`, although the effect is within the two bootstrap uncertainty ranges
+    - so at this node there is greater uncertainty in peak demand at the weekend, not significant tho
+
+```{r fig.height=5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+sample_ids <- c("ss5","ss1","ss4_fdr2","ss4_fdr1")
+par(mfrow=c(2,4))
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+for(i in sample_ids){
+tempdata <- pklcl_data[id==i & kfold!="Test"]
+fold <- "Test"
+term.plot(agg_m3[[i]]$Test,what = "sigma",rug = TRUE,ask = FALSE,data = tempdata,ylim = "free",main=i)
+# term.plot(agg_m3$ps1$Test,what = "sigma",rug = TRUE,pages = 1,ask = FALSE,data = tempdata,ylim="free")
+}
+
+
+
+```
+
+here's a weird fit at `ss5_fdr4` as well
+
+- negative linear relationship with lagged demand?!
+- nb: checked monotonic penalised splines for linear relationship - not helpful
+- boosting will help this!!! and constrained regression
+
+
+```{r fig.height=2.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+sample_ids <- c("ss5_fdr4")
+par(mfrow=c(1,5))
+for(i in sample_ids){
+tempdata <- pklcl_data[id==i & kfold!="Test"]
+fold <- "Test"
+term.plot(agg_m3[[i]]$Test,what = "mu",rug = TRUE,ask = FALSE,data = tempdata,ylim = "free",main=i)
+# term.plot(agg_m3$ps1$Test,what = "sigma",rug = TRUE,pages = 1,ask = FALSE,data = tempdata,ylim="free")
+}
+
+
+
+```
+
+Finally, here is some fan plots of the benchmark vrs. model 3 fan plots over the entire data
+
+- we have definitely gotten sharper :)
+- missing spike due to v. cold temps at the feeder level!
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+sample_ids <- c("ps1","ss4","ss2_fdr3")
+par(mfrow=c(3,2))
+
+for(i in sample_ids){
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+  
+plot(agg_bench_mqr[[i]],q50_line = TRUE,main=paste0(i," --- bench"),cols = colorRampPalette(c("gold", "red")))
+lines(pklcl_data[id==i,demand])
+  
+
+plot(agg_m3_mqr[[i]],q50_line = TRUE,main=paste0(i," --- m3"),cols = colorRampPalette(c("gold", "red")))
+lines(pklcl_data[id==i,demand])
+
+}
+
+
+
+```
+
+
+Finally, Let's take the PIT values for model three
+
+- ok it doesn't look great at some of the feeder levels especially, but we have v. few observations
+
+
+```{r fig.height=15,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+eval_agg$m3_pit <- ml_PIT(ppd_list = agg_m3,
+                       melted_dt = pklcl_data[aggregation!="sm"],
+                       split_col = "id",
+                       sort_cols = "date_time")
+
+
+invisible(lapply(names(eval_agg$m3_pit),function(x){
+  
+  pklcl_data[id==x,pit_m3:=eval_agg$m3_pit[[x]]]
+  
+  
+}))
+
+
+group.colors <- c(mean = "steelblue", id =alpha("grey50",0.5), ideal="black")
+pklcl_data[aggregation!="sm",ggplot(data=.SD, aes(x=pit_m3)) + labs(y = "density [-]", x = " probability level")
+        +geom_histogram(aes(y=after_stat(density)), fill = "grey75", color = "white", boundary=1, binwidth = 0.05)
+        +geom_hline(aes(yintercept = 1,colour = "ideal"), linetype = "dashed")
+        +scale_colour_manual(name = NULL,values=group.colors)
+        +facet_wrap(~id,ncol=3)
+        +theme(legend.position="top")]
+
+
+
+
+```
+
+And have a look at the correlation matrix between the PIT values between the different levels
+
+- is this hypothetical hierarchy truly representative? must have impact on PIT correlations results
+- there are correlation 'blocks' within aggregate levels
+
+```{r fig.height=15,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+uobs <- pklcl_data[aggregation!="sm",.(date_uk,id,aggregation,kfold,u=pit_m3)]
+  
+# # reorder to match split function...
+# need to save some space
+site_nms <- names(agg_m3)
+site_nms <- c("ps1",grep("ss[0-9]$",site_nms,value = T),site_nms[-c(1,grep("ss[0-9]$",site_nms))])
+uobs[,id := factor(id,levels = site_nms)]
+
+
+########spatial copula
+uobs <- dcast(uobs,kfold+date_uk~id,value.var = c("u"))
+setorder(uobs,date_uk)
+  
+ccm <- covcor_matrix(uobs[,.SD,.SDcols=colnames(uobs)[-c(1,2)]],cov_cor = "correlation",kfold=uobs[,kfold],
+                      method = 'pearson',use = 'pairwise.complete.obs',boundary_threshold = NA)
+col6 <- colorRampPalette(c("blue","cyan","yellow","red"))
+lattice::levelplot(ccm$Tes,xlab="node id", ylab="node id",col.regions=col6(600), cuts=100, at=seq(-.1,1,0.01),main="Test --- GC-correlation",
+                  scales=list(x=list(rot=45),y=list(rot=45),tck=0.3,cex=1.2))
+
+
+# lapply(ccm,chol)
+
+rm(uobs,tempdata,imp_dt,ccm,boot_dt,ind_plot,ind_plot2)
+invisible(gc())
+
+
+
+```
+
+
+
+Some notes
+
+- temperature variable?
+  - we're missing the peaks when it's freezing cold
+  - temp forecasts? freezing/not freezing cat.
+  - midas data...ecmwf forecasts averaged over london?
+- boosting would help with variable selection on per-node basis --- gamboostLSS!
+- holidays?
+
+## smart meter forecasting - subset at secondary substation 4 (ss4)
+
+
+First let's have a closer at a few example nodes at the bottom the hierarchy
+
+- we will sample a few IDs
+- in `N0236` first there's clearly some seasonality present, as observed before
+- in the second, there's not as far as eyeballing goes
+- looks like there's an impact of holidays as well in the data, from `N2285` where the household is clearly empty at points
+
+```{r fig.height=5,fig.width=15}
+
+
+set.seed(111)
+smp_ids <- lcl_data[peak_ind==1 & aggregation=="sm",sample(unique(id),5)]
+
+ggplot(data=pklcl_data[id%in%smp_ids],aes(x=date_uk,y=demand))+
+  labs(y = "max demand [kWh]", x = "date [uk]")+
+  geom_line(colour="steelblue")+
+  facet_wrap(~id,nrow=1)
+
+
+```
+
+Now let's plot the acf and pacf at a few of the nodes to see what's what
+
+- this plot confirms the previous
+- some show quite high autocorrelation with significant lags at 1,2,7 etc.
+- some show basically very little autocorrelation, maybe with lag 7, 14 borderline though
+
+```{r fig.height=7.5,fig.width=15}
+
+ac_plot <- list()
+for(i in smp_ids){
+  
+  series <- pklcl_data[id==i,demand]
+  
+  # compute acf without plotting
+  ac <- acf(series, plot=F,lag.max = 31)
+  pac <- pacf(series, plot=F,lag.max = 31)
+
+  # 95% confidence interval limits
+  ci <- qnorm((1 + 0.95)/2)/sqrt(sum(!is.na(series)))  
+
+  # convert to data frame
+  ac_plot[[i]] <- rbind(data.table(fun="acf",lag=ac$lag[,,1], corr=ac$acf[,,1],ci=ci),
+                        data.table(fun="pacf",lag=pac$lag[,,1], corr=pac$acf[,,1],ci=ci))
+  
+  rm(series,ac,pac,ci)
+  
+}
+
+
+
+ac_plot <- rbindlist(ac_plot,idcol = "id")
+
+
+# use data frame for ggplot
+ggplot(ac_plot, aes(lag, y=corr)) + geom_area(fill="grey") +
+  geom_hline(aes(yintercept=ci), linetype="dashed",color="red",data = ac_plot[,.(ci=unique(ci)),by=.(fun,id)]) +
+  geom_hline(aes(yintercept=-ci), linetype="dashed",color="red",data = ac_plot[,.(ci=unique(ci)),by=.(fun,id)]) +
+  scale_y_continuous(breaks=seq(-4,1,0.2))+
+  geom_point() + 
+  geom_segment( aes(x=lag, xend=lag, y=0, yend=corr))+
+  facet_grid(fun~id)
+
+
+
+```
+
+Let's have a wee plot of some lags at these IDs
+
+- the lags seem to be useful at some sites, although there's clearly a lot of uncertainty
+- I think this is going to be quite tough
+- maybe boosting will help, or lasso, or clustering?
+
+```{r fig.height=7.5,fig.width=15}
+
+
+ggplot(data=melt(pklcl_data[id%in%smp_ids,.(id,demand,demandpk_l1,demandpk_l7)],measure.vars = 3:4),aes(y=demand,x=value))+
+  labs(y = "peak demand [kWh]",x = "peak demand lag [kWh]")+
+  geom_point(colour="steelblue")+
+  facet_grid(variable~id,scales = "free")
+
+
+
+```
+
+Here is a plot of these node's histograms
+
+- There's clearly no node where we have any 'net demand' (confirmed below)
+- therefore we have to consider strictly positive distributions
+- since we are close to zero now, we need to consider this rather than rely on the thin tails of the gaussian as before :)
+
+
+```{r fig.height=5,fig.width=15}
+
+
+
+ggplot(data=melt(pklcl_data[id%in%smp_ids,.(id,demand)],measure.vars =2))+
+  labs(x = "max demand [kWh]")+
+  geom_histogram(aes(value),bins=100)+
+  facet_grid(~id,scales = "free_y")
+
+
+
+```
+
+Any zero values in the peak demand?
+
+- good :)
+
+```{r}
+pklcl_data[demand==0,.N,by=.(id)]
+
+```
+
+### smart meter gamlss
+
+I'm not 100% sure what conditional distribution will be suitable here
+
+- we know we have a range of SM types, therefore the dist has to be flexible, i.e. have a few parameters
+- the data will be on the realplus line
+- most SMs will have positive skewness, because of the nature of peak demand
+
+
+Ok so we've cycled through the densities and fit a range of marginal distributions to the peak demand data. The following table of counts, shows the top marginal distribution at each node
+
+- these give an idea of what could be a useful conditional distribution I've found
+- the BCPE has a tendency to fail in my experience
+- we will try the GB2 distribution, I have prior experience and it worked really well
+- truncated gaussian was also tried (not shown), but was failing at some nodes due to proximity of some SMs to zero I think
+
+```{r fig.height=10,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+ids <- pklcl_data[aggregation=="sm" & ss_id=="ss4",unique(id)]
+
+gamlls_MLtst <- lapply(ids,function(x){fitDist(pklcl_data[id==x,demand],type="realplus")})
+
+plot(table(names(unlist(lapply(gamlls_MLtst,function(x){x$fits[1]})))),las=2)
+
+
+```
+
+
+For the sake of continuity we will apply a similar model to the previous aggregate levels to test it's ability down at the bottom level
+
+We will use a generalised beta of the second kind (GB2) for our conditional distribution, details below
+
+- sm_bench
+  - $\mu = \beta_\mu + \beta_1 pd_{t-1} + \beta_2 pd_{t-7}$
+  - $\sigma = \beta_\sigma$ (i.e. constant variance)
+  - $\nu = \beta_\nu$
+  - $\tau = \beta_\tau$
+
+- sm_m1:
+  - $\mu = \beta_\mu + \beta_1 pd_{t-1} + \beta_2 pd_{t-7} + f_{ps}(\text{doy,k=12,df=4})$
+  - $\sigma = \beta_\sigma + \beta_3 pd_{t-1}$
+  - $\nu = \beta_\nu$
+  - $\tau = \beta_\tau$
+
+- sm_m2:
+  - $\mu = \beta_\mu + \beta_1 pd_{t-1} + \beta_2 pd_{t-7} + f_{ps}(\text{doy,k=12, df=4})$
+  - $\sigma = \beta_\sigma + \beta_3 pd_{t-1}$ 
+  - $\nu = \beta_\nu + \beta_4 pd_{t-1}$
+  - $\tau = \beta_\tau$
+  
+- sm_m3:
+  - $\mu = \beta_\mu + \beta_1 pd_{t-1} + \beta_2 pd_{t-7} + f_{ps}(\text{doy,k=12,df=4}) + \beta_4dow$ (doy_uk is an indicator variable 0 at weekends 1 at weekdays)
+  - $\sigma = \beta_\sigma + \beta_5 pd_{t-1} + \beta_6dow$
+  - $\nu = \beta_\nu + \beta_6 pd_{t-1}$
+  - $\tau = \beta_\tau$
+
+
+where $f_{ps}$ is a penalised spline with $k$ knots and $df$ degrees of freedom
+
+note that the $sd(d_{t-1})$ variable (the standard deviation of yesterday's demand profile) is not used here, because this can be close to zero at some houses when the household is on holiday etc. which was causing the model to fail
+
+
+We use a generalized additive model of the form
+
+$$
+pd \sim \mathcal{GB}_2(\mu, \sigma, \nu, \tau)\\
+g_\mu(\mu) = \beta_{\mu} + \sum_{i_{\mu}}^{I_{\mu}} f_{i_{\mu}}(x_{i_{\mu}}) \\
+g_\sigma(\sigma) = \beta_{\sigma} + \sum_{i_{\sigma}}^{I_{\sigma}} f_{i_{\sigma}}(x_{i_{\sigma}}) \\
+g_\nu(\nu) = \beta_{\nu} + \sum_{i_{\nu}}^{I_{\nu}} f_{i_{\nu}}(x_{i_{\nu}}) \\
+g_\tau(\tau) = \beta_{\tau} + \sum_{i_{\tau}}^{I_{\tau}} f_{i_{\tau}}(x_{i_{\tau}})
+$$
+
+where the first line means that daily peak demand $pd$ follows a Generalized Beta distribution (of the second kind), and the $\mu, \sigma, \nu, \tau$ components are the location scale and shape components of the distribution. These distribution parameters are modelled by an additive function of the inputs $x$, which can be linear and non-linear (e.g. p-splines) and the others are regression coefficients
+
+
+Ok let's fit the models now, to begin we will pick out the smart meters on SS4 for quickness
+
+- looks like we have a nice mix of SM characteristics as before
+- there's some weird ones creeping in though ---> `N0894`
+
+```{r fig.height=5,fig.width=15}
+
+set.seed(1111)
+smp_ids <- c(pklcl_data[aggregation=="sm" & ss_id=="ss4",sample(unique(id),5)],"N0894")
+
+ggplot(data=pklcl_data[id%in%smp_ids],aes(x=date_uk,y=demand))+
+  labs(y = "max demand [kWh]", x = "date [uk]")+
+  geom_line(colour="steelblue")+
+  facet_wrap(~id,nrow=1)
+
+```
+
+Now to fit the four models
+
+ - looks like there's some convergence problems at some nodes
+ - let's see what the prediction/evaluation results are like before doing extra iters/different fitting algos
+ - actually although there's some convergence issues the default gives the best predictions, in my testing (results not shown), the cole and green/ mixed/RS with lot's of iterations doesn't work too well either - although CG(2000) converges in the benchmark
+
+
+```{r fig.height=10,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+sm_gamlss <- list()
+sm_gamlss$sm_bench <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                                   vars = c("demand","demandpk_l1","demandpk_l7"),
+                                   split_col = "id",
+                                   sort_cols = "date_time",
+                                   ncores = 8,
+                                   ncores_inner = 1,
+                                   formula = demand~demandpk_l1+demandpk_l7,
+                                   sigma.formula = ~1,
+                                   nu.formula = ~1,
+                                   tau.formula = ~1,
+                                   family = GB2,
+                                   parallel_inner = FALSE)
+
+# sapply(sm_gamlss$sm_bench,function(z){sum(sapply(z,function(x){x$converged}))})
+
+## got convergence problems with these models at a few nodes with RS() and CG()
+## it seems that leaving the algorithm at default works.....
+## I think this is to do with the RS algorithm and the shape/scale formulas for the GB2 distribution- 
+## see https://doi.org/10.1111/j.1467-9876.2005.00510.x section 5.
+sm_gamlss$sm_m1 <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                                vars = c("demand","demandpk_l1","demandpk_l7","doy_uk"),
+                                split_col = "id",
+                                sort_cols = "date_time",
+                                ncores = 8,
+                                ncores_inner = 1,
+                                formula = demand~demandpk_l1+demandpk_l7+pb(doy_uk,control = pb.control(inter = 12),df=4),
+                                sigma.formula = ~demandpk_l1,
+                                nu.formula = ~1,
+                                tau.formula = ~1,
+                                family = GB2,
+                                parallel_inner = FALSE)
+
+
+sm_gamlss$sm_m2 <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                                vars = c("demand","demandpk_l1","demandpk_l7","doy_uk"),
+                                split_col = "id",
+                                sort_cols = "date_time",
+                                ncores = 8,
+                                ncores_inner = 1,
+                                formula = demand~demandpk_l1+demandpk_l7+pb(doy_uk,control = pb.control(inter = 12),df=4),
+                                sigma.formula = ~demandpk_l1,
+                                nu.formula = ~demandpk_l1,
+                                tau.formula = ~1,
+                                family = GB2,
+                                parallel_inner = FALSE)
+
+
+sm_gamlss$sm_m3 <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                                vars = c("demand","demandpk_l1","demandpk_l7","doy_uk","dow_ftr"),
+                                split_col = "id",
+                                sort_cols = "date_time",
+                                ncores = 8,
+                                ncores_inner = 1,
+                                formula = demand~demandpk_l1+demandpk_l7+pb(doy_uk,control = pb.control(inter = 12),df=4) + dow_ftr,
+                                sigma.formula = ~demandpk_l1 + dow_ftr,
+                                nu.formula = ~demandpk_l1,
+                                tau.formula = ~1,
+                                family = GB2,
+                                parallel_inner = FALSE)
+
+# ### remove non-fitting SMs (4!)
+# prob_ids <- unique(unlist(lapply(sm_gamlss,function(z){names(which(sapply(z, function(x){class(x[1])=="character"})))})))
+# pklcl_data[,prob_id:=0]
+# pklcl_data[id%in%prob_ids,prob_id:=1]
+# sm_gamlss <- lapply(sm_gamlss,function(x){x[-which(names(x)%in%prob_ids)]})
+
+# check covergence
+lapply(sm_gamlss,function(y){sum(sapply(y,function(z){sum(sapply(z,function(x){x$converged}))==length(z)}))==length(y)})==length(sm_gamlss)
+
+
+```
+
+
+We will bootstrap the CRPS as before
+- there's obviously a problem with the forecasts at a few SM ids, which are dominating the CRPS
+- let's find them, exclude them from the CRPS eval, then inspect them
+
+
+```{r fig.height=10,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+### error messages galore here....?
+### same error messages in predict help! https://rdrr.io/cran/gamlss/man/predict.gamlss.html
+sm_gamlss_params <- lapply(sm_gamlss,function(x){
+  
+  
+  ml_ppd2mqr(ppd_list = x,
+             melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+             split_col = "id",
+             sort_cols = "date_time",
+             params=TRUE)
+  
+  
+  
+})
+
+
+
+sm_gamlss_mqr <- lapply(sm_gamlss,function(x){
+  
+  
+  ml_ppd2mqr(ppd_list = x,
+             melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+             split_col = "id",
+             sort_cols = "date_time",
+             quantiles = seq(0.01,0.99,0.01))
+  
+  
+  
+})
+
+
+
+
+eval_sm <- lapply(names(sm_gamlss_mqr), function(x){
+  
+  
+  crps <- rbindlist(ml_crps_mqr(mqr_list = sm_gamlss_mqr[[x]],
+                               melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                               method="kde",
+                               mod_name = x,
+                               sort_cols = c("date_uk","fdr_id")),idcol = "id")
+
+  crps[kfold!="Test",kfold:="All_cv"]
+  
+  
+})
+
+names(eval_sm) <- paste0("crps_",names(sm_gamlss_mqr))
+
+boot_data <- cbind(eval_sm$crps_sm_bench,eval_sm$crps_sm_m1[,.(sm_m1)],
+                   eval_sm$crps_sm_m2[,.(sm_m2)],eval_sm$crps_sm_m3[,.(sm_m3)])
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("fdr_id","kfold"),
+                     eval_cols = c("sm_bench","sm_m1","sm_m2","sm_m3"))
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps [kWh]")
+        +geom_boxplot()
+        +facet_grid(fdr_id~kfold,scales = "free")
+        +theme(legend.position="top")]
+
+
+
+```
+
+ok it looks like we have two offenders
+
+
+```{r}
+
+prob_eval <- boot_data[,lapply(.SD,mean),by=.(fdr_id,id),.SDcols=paste0("sm_",c("bench","m1","m2","m3"))]
+
+
+setorder(prob_eval,-sm_m3)
+
+prob_eval
+
+prob_ids <- c("N1865","N4078")
+
+
+```
+
+
+We seem to have a problem at
+
+- `N1865` and `N4078` at the least
+- this could be an argument for using the benchmark model, which doesn't seem to be effected by the problem
+- the problem must be stemming from the doy_uk variable, or using conditional heteroskedastic formulation
+- without the problematic nodes we can see that the advanced models seem to improve the CRPS, looks like variable improvement as expected
+
+
+```{r fig.height=10,fig.width=15}
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data[!(id%in%prob_ids)],
+                     by_cols = c("fdr_id","kfold"),
+                     eval_cols = c("sm_bench","sm_m1","sm_m2","sm_m3"),
+                     skillscore_b = "sm_bench")
+
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement [%]")
+        +geom_boxplot()
+        +facet_grid(fdr_id~kfold, scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+```
+
+Here we have a comparison of the CRPS improvement for `sm_m2` versus the `benchmark`
+
+- the scale of the improvement is very variable which is worrying
+- this is excluding the nodes which are causing problems
+
+
+```{r fig.height=10,fig.width=15}
+
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data[!(id%in%prob_ids)],
+                     by_cols = c("fdr_id","id","kfold"),
+                     eval_cols = c("sm_bench","sm_m1","sm_m2","sm_m3"),
+                     skillscore_b = "sm_bench")
+
+
+
+boot_dt[model_id=="sm_m2",
+        ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement against bench [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(fdr_id~kfold+model_id,scales = "free_y", space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+```
+
+
+Let's have a look at the fan plots for these problem nodes, and a good performing one
+
+- ok this is really interesting
+- at the first node, we can see that the forecast seems to give reasonable forecasts with dynamic uncertainty
+- holidays are clearly important to consider - rle or changepoint?
+- the benchmark model has dynamic uncertainty because it's GB2 distribution
+- the extra parameters help clearly at this node to reduce the uncertainty
+- at the second/third node, including the lag dependency on the scale parameter leads to unrealistic spikes
+- we see unrealistic spikes in even in the benchmark
+
+
+```{r fig.height=10,fig.width=15}
+
+set.seed(1111)
+smp_ids <- c("N0831",prob_ids)
+par(mfrow=c(3,2))
+for(i in smp_ids){
+  
+  
+plot(sm_gamlss_mqr$sm_bench[[i]],q50_line = TRUE,main=paste0(i," --- sm_bench"),cols = colorRampPalette(c("gold", "red")),ylim=c(0,4))
+lines(pklcl_data[id==i,demand])
+  
+plot(sm_gamlss_mqr$sm_m3[[i]],q50_line = TRUE,main=paste0(i," --- sm_m3"),cols = colorRampPalette(c("gold", "red")),ylim=c(0,4))
+lines(pklcl_data[id==i,demand])
+
+}
+
+```
+
+ok first let's inspect these nodes
+
+- here we are plotting both hourly demand data
+- it looks like the problem nodes occur when the house is frequently empty, and there are significant drops in demand, followed by spikes
+- note that is not a problem node, here the household demand drops once, clearly due to single holiday
+
+
+```{r fig.height=5,fig.width=15}
+
+
+ggplot(data=lcl_data[id%in%prob_ids],aes(x=date_uk,y=demand))+
+  labs(y = "demand [kWh]", x = "date [uk]")+
+  geom_line(colour="steelblue")+
+  facet_wrap(~id,nrow=2,scale="free")
+
+
+
+```
+
+Here is the peak demand time-series
+
+- the problem is more evident here
+- let's try to make an empty household feature!
+- we will flag days within which the daily variance is below a threshold value of 0.001 (the fitting procedure is sensitive to this value)
+- then run lengths of >=7 below this value will be classed as an empty house
+- then we only retain the feature on SMs that have >31 datapoints classed as empty ---> we're targeting regularly empty houses!
+- otherwise the feature will not be spread around the kfold structure, and will be difficult to incorporate
+- we will then use a lag1 empty house feature for our model
+
+
+```{r fig.height=5,fig.width=15}
+
+
+# pklcl_data[,empty_h:=NULL]
+# pklcl_data[,empty_h_l1:=NULL]
+
+# set threshold and fill in empty house indicators
+pklcl_data[,empty_h:=0]
+pklcl_data[dvar_demand<=0.001,empty_h:=1]
+
+
+# run-length encoding for blocks of 'emptyness'
+pklcl_data[,grp:=rleid(empty_h),by=.(id)]
+
+# set a minimum of 7 days for a block to be defined empty
+empty_grp <- pklcl_data[empty_h==1,.N,by=.(id,grp)][N>=7]
+
+# redifine the empty indicator to be only these blocks
+pklcl_data[,empty_h:=0]
+for(i in unique(empty_grp$id)){
+  
+  
+  pklcl_data[id==i & grp%in%empty_grp[id==i,grp],empty_h:=1]
+  
+  
+}
+
+# set nodes which have <1 month of empty data to zero, see comment
+pklcl_data[id%in%pklcl_data[empty_h==1,.N,by=.(id)][N<31]$id,empty_h:=0]
+
+# shift for prediction
+pklcl_data[,empty_h_l1:=shift(empty_h,n=1L,fill = empty_h[1L]),by=.(id)]
+
+
+pklcl_data[,empty_h:=as.factor(empty_h)]
+pklcl_data[,empty_h_l1:=as.factor(empty_h_l1)]
+
+
+
+ggplot(data=pklcl_data[id%in%c(prob_ids)],aes(x=date_uk,y=demand))+
+  labs(y = "max demand [kWh]", x = "date [uk]")+
+  geom_point(aes(colour=empty_h))+
+  geom_line(color="grey70")+
+  facet_wrap(~id,nrow=2,scale="free")
+
+
+```
+
+
+So, here we have the fifth and final formulation for the smart meter gamlss
+
+- sm_m4:
+  - $\mu = \beta_\mu + \beta_1 pd_{t-1} + \beta_2 pd_{t-7} + f_{ps}(\text{doy,k=12,df=4}) + \beta_4dow + \beta_5EH_{t-1}$
+  - $\sigma = \beta_\sigma + + \beta_6 EH_{t-1}$
+  - $\nu = \beta_\nu + \beta_7 EH_{t-1}$
+  - $\tau = \beta_\tau$
+
+where $EH_{t-1}$ is the empty house indicator factor, at one lag
+
+
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+
+sm_gamlss$sm_m4 <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                      vars = c("demand","demandpk_l1","demandpk_l7","doy_uk","dow_ftr","empty_h_l1"),
+                      split_col = "id",
+                      sort_cols = "date_time",
+                      ncores = 8,
+                      ncores_inner = 1,
+                      formula = demand~demandpk_l1+demandpk_l7+pb(doy_uk,control = pb.control(inter = 12),df=4)+ empty_h_l1 +dow_ftr,
+                      sigma.formula = ~ empty_h_l1,
+                      nu.formula = ~empty_h_l1,
+                      tau.formula = ~1,
+                      family = GB2,
+                      parallel_inner = FALSE)
+
+
+# unique(sapply(sm_gamlss$sm_m4,function(z){sum(sapply(z,function(x){x$converged}))}))
+lapply(sm_gamlss,function(y){sum(sapply(y,function(z){sum(sapply(z,function(x){x$converged}))==length(z)}))==length(y)})
+
+```
+
+
+
+
+- nb: the dow_ftr/demand lag was causing a spike at some nodes, in the sigma formula for the model
+- I don't think it makes sense to over-engineer the location shape and scale parameters for the GB2, because the $\mu$ value already effects the scale of the distribution
+
+- from the looks of the CRPS we seem to have made stable predictions now, across all the SMs
+- yay!
+
+```{r fig.height=7.5,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+# ### remove non-fitting SMs (4!)
+# prob_ids <- unique(unlist(lapply(sm_gamlss,function(z){names(which(sapply(z, function(x){class(x[1])=="character"})))})))
+# prob_ids
+# pklcl_data[,prob_id:=0]
+# pklcl_data[id%in%prob_ids,prob_id:=1]
+# sm_gamlss <- lapply(sm_gamlss,function(x){x[-which(names(x)%in%prob_ids)]})
+
+
+
+sm_gamlss_mqr$sm_m4 <- ml_ppd2mqr(ppd_list = sm_gamlss$sm_m4,
+                                   melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                                   split_col = "id",
+                                   sort_cols = "date_time",
+                                   quantiles = seq(0.01,0.99,0.01))
+
+
+
+
+eval_sm$crps_sm_m4 <- rbindlist(ml_crps_mqr(mqr_list = sm_gamlss_mqr$sm_m4,
+                                             melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                                             method="kde",
+                                             mod_name = "sm_m4",
+                                             sort_cols = c("date_uk","fdr_id")),idcol = "id")
+
+eval_sm$crps_sm_m4[kfold!="Test",kfold:="All_cv"]
+  
+ 
+
+boot_data <- cbind(eval_sm$crps_sm_bench,eval_sm$crps_sm_m1[,.(sm_m1)],
+                   eval_sm$crps_sm_m2[,.(sm_m2)],eval_sm$crps_sm_m3[,.(sm_m3)],
+                   eval_sm$crps_sm_m4[,.(sm_m4)])
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("fdr_id","kfold"),
+                     eval_cols = c("sm_bench","sm_m1","sm_m2","sm_m3","sm_m4"),
+                     skillscore_b = "sm_bench")
+
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement [%]")
+        +geom_boxplot()
+        +facet_grid(fdr_id~kfold, scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+                        
+  
+```
+
+Here is the same plot with the 'problematic' nodes removed from the bootstrapping
+
+- it is clear that the more robust model is at the expense of some forecasting skill
+- especially at feeder 1 and 4
+- I think it's better to have a robust model, in this case
+
+
+```{r fig.height=10,fig.width=15}
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data[!(id%in%prob_ids)],
+                     by_cols = c("fdr_id","kfold"),
+                     eval_cols = c("sm_bench","sm_m1","sm_m2","sm_m3","sm_m4"),
+                     skillscore_b = "sm_bench")
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement [%]")
+        +geom_boxplot()
+        +facet_grid(fdr_id~kfold, scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+```
+
+
+Here we have a comparison of the CRPS improvement for `sm_m4` versus the benchmark
+
+- this inspires a bit more confidence
+- clearly there is still variable improvement, but it is now skewed to positive improvement
+- at some nodes, a simpler model is better
+
+
+```{r fig.height=10,fig.width=15}
+
+
+
+imp_dt <- eval_boot(melted_evaldt = boot_data,
+                    by_cols = c("fdr_id","id","kfold"),
+                    eval_cols = c("sm_bench","sm_m4"),
+                    skillscore_b = "sm_bench")
+
+
+
+imp_dt[model_id=="sm_m4",
+       ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement against bench [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(fdr_id~kfold+model_id,scales = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+```
+
+
+Finally, now let's check those fan plots from before
+
+- the lag of the holiday feature seems to be working really well here
+
+```{r fig.height=10,fig.width=15}
+
+set.seed(1111)
+smp_ids <- c("N0831",prob_ids)
+par(mfrow=c(3,2))
+for(i in smp_ids){
+  
+  
+plot(sm_gamlss_mqr$sm_bench[[i]],q50_line = TRUE,main=paste0(i," --- sm_bench"),cols = colorRampPalette(c("gold", "red")))
+lines(pklcl_data[id==i,demand])
+  
+plot(sm_gamlss_mqr$sm_m4[[i]],q50_line = TRUE,main=paste0(i," --- sm_m4"),cols = colorRampPalette(c("gold", "red")))
+lines(pklcl_data[id==i,demand])
+
+}
+
+```
+
+
+Now let's check three more "normal" nodes to see the predictions
+
+- I think at some of the nodes, kernel density estimation might be more suitable
+- the forecasts aren't exactly skillful to my eye
+- we could be modelling the noise at some nodes lol
+
+
+
+```{r fig.height=7.5,fig.width=15}
+set.seed(1111)
+# smp_ids <- c("N0003","N1865","N1722","N2383","N2836","N0956")
+smp_ids <- pklcl_data[aggregation=="sm" & ss_id=="ss4",sample(unique(id),3)]
+
+
+par(mfrow=c(3,2))
+for(i in smp_ids){
+  
+  
+plot(sm_gamlss_mqr$sm_bench[[i]],q50_line = TRUE,main=paste0(i," --- sm_bench"),cols = colorRampPalette(c("gold", "red")))
+lines(pklcl_data[id==i,demand])
+
+
+plot(sm_gamlss_mqr$sm_m4[[i]],q50_line = TRUE,main=paste0(i," --- sm_m4"),cols = colorRampPalette(c("gold", "red")))
+lines(pklcl_data[id==i,demand])
+
+}
+
+
+
+```
+
+
+Ok let's check the reliability diagrams at a few nodes to check if we're at least well calibrated
+
+- to be honest I expected worse, expect for a nodes, we seem to be ok. This is of course given the amount of data we have for evaluation
+- On average (blue) we seem to be well calibrated in both CV and testing
+- I think that's a pretty good outcome, the PITs don't look great though (not shown), although we have ~350 obs
+
+```{r fig.height=10,fig.width=15}
+
+eval_sm$sm_m4_rel <- ml_eval_mqr(mqr_list =sm_gamlss_mqr$sm_m4,
+                                  metric = "rel",
+                                  melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                                  obs_col = "demand",
+                                  split_col = "id",
+                                  sort_cols = "date_time",
+                                  plot.it=FALSE)
+
+
+eval_sm$sm_m4_rel <- rbindlist(eval_sm$sm_m4_rel,idcol="id")
+eval_sm$sm_m4_rel[,kfold:=as.character(kfold)]
+eval_sm$sm_m4_rel[pklcl_data,fdr_id:=fdr_id,on=.(id)]
+
+
+group.colors <- c(mean = "steelblue", id =alpha("grey50",0.5), ideal="black")
+
+ggplot(data=eval_sm$sm_m4_rel[kfold%in%c("All_cv","Test")],aes(x= Nominal)) + 
+  labs(y = "empirical coverage [-]", x = "nominal coverage [-]") + 
+  geom_line(aes(y=Empirical, group =  id, colour="id")) +
+  geom_point(aes(y=Empirical, group =  id,colour="id"), size = 1) +
+  geom_line(aes(x = Nominal, y=Empirical, colour = "mean"),
+                       data = eval_sm$sm_m4_rel[kfold%in%c("All_cv","Test"),list(Empirical=mean(Empirical)),by=.(Nominal,kfold,fdr_id)]) + 
+  geom_point(aes(x = Nominal, y=Empirical, colour = "mean"),
+                        data = eval_sm$sm_m4_rel[kfold%in%c("All_cv","Test"),list(Empirical=mean(Empirical)),by=.(Nominal,kfold,fdr_id)]) +
+  geom_line(aes(y=Nominal, colour="ideal"), linetype = "dashed") + 
+  facet_grid(fdr_id~kfold) + 
+  theme(legend.position="top") +
+  scale_colour_manual(name = NULL,values=group.colors,labels = c("individual ids","ideal","average"))+
+  guides(color = guide_legend(override.aes = list(linetype=c(1,2,1),shape = c(16,NA,16))))
+
+
+
+
+```
+
+### smart meter KDE
+
+here we will use a simple kernel density estimation as our density forecast for the peak load
+
+- first we will test an unconditional kde --- kde_u
+- second we will test a conditional kde based on the weekend/weekday feature --- kde_wdwe
+- the bandwidth for the kde estimate is determined using the Sheather & Jones method https://www.jstor.org/stable/pdf/2345597.pdf, for now...CRPS estimation?
+- the kernels are truncated gaussians at 0 to account for non-negativity
+
+Here we plot the bootstrapped crps of the two kde methods versus the benchmark and m4 gamlss model
+
+- both gamlss models give significant improvements in CRPS, showing there's some skill in the regression forecasts
+- this is consistent in both CV and testing datasets
+
+
+```{r fig.height=10,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+rm(gamlls_MLtst,tmp_plot,inds,ids,i,fold,ac_plot,boot_data,boot_dt,empty_grp,imp_dt)
+
+#################################KDE U
+sm_kde <- list()
+sm_kde$kde_u <- ml_kde(melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                       target_var = "demand",
+                       split_col = "id",
+                       sort_cols = "date_time",
+                       ncores = 8L)
+
+sm_kde_mqr <- list()
+sm_kde_mqr$kde_u <- ml_kde2mqr(kde_list = sm_kde$kde_u,
+                               melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                               quantiles = seq(0.01,0.99,0.01),
+                               split_col = "id",
+                               sort_cols = "date_time")
+
+
+eval_sm$crps_sm_kde_u <- rbindlist(ml_crps_mqr(mqr_list = sm_kde_mqr$kde_u,
+                                               melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                                               method="kde",
+                                               mod_name = "sm_kde_u",
+                                               sort_cols = c("date_uk","fdr_id")),idcol = "id")
+
+eval_sm$crps_sm_kde_u[kfold!="Test",kfold:="All_cv"]
+
+
+
+########################################### KDE_Cond
+
+sm_kde$kde_wdwe <- ml_kde(melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                         target_var = "demand",
+                         split_col = "id",
+                         sort_cols = "date_time",
+                         ncores = 8L,
+                         by_var = "dow_ftr")
+
+sm_kde_mqr$kde_wdwe <- ml_kde2mqr(kde_list = sm_kde$kde_wdwe,
+                                  melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                                  quantiles = seq(0.01,0.99,0.01),
+                                  split_col = "id",
+                                  sort_cols = "date_time",
+                                  by_var = "dow_ftr")
+
+
+eval_sm$crps_sm_kde_wdwe <- rbindlist(ml_crps_mqr(mqr_list = sm_kde_mqr$kde_wdwe,
+                                               melted_dt = pklcl_data[aggregation=="sm" & ss_id=="ss4"],
+                                               method="kde",
+                                               mod_name = "sm_kde_wdwe",
+                                               sort_cols = c("date_uk","fdr_id")),idcol = "id")
+
+eval_sm$crps_sm_kde_wdwe[kfold!="Test",kfold:="All_cv"]
+
+
+
+####################### EVAL
+
+
+
+
+
+
+
+boot_data <- cbind(eval_sm$crps_sm_bench,eval_sm$crps_sm_m4[,.(sm_m4)],
+                   eval_sm$crps_sm_kde_u[,.(sm_kde_u)],eval_sm$crps_sm_kde_wdwe[,.(sm_kde_wdwe)])
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("fdr_id","kfold"),
+                     eval_cols = c("sm_bench","sm_m4","sm_kde_u","sm_kde_wdwe"),
+                     skillscore_b = "sm_bench")
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement [%]")
+        +geom_boxplot()
+        +facet_grid(fdr_id~kfold, scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+```
+
+Looking at it on a per-node bases we can see the picture is more complicated.
+
+- here we compare the conditional kde (kde_wdwe) model against the m4_gamlss regression
+- again we see variable crps improvement
+- some nodes show a major decrease in CRPS, others a more variable change in skill
+
+
+```{r fig.height=10,fig.width=15}
+
+imp_dt <- eval_boot(melted_evaldt = boot_data,
+                    by_cols = c("fdr_id","id","kfold"),
+                    eval_cols = c("sm_m4","sm_kde_wdwe"),
+                    skillscore_b = "sm_m4")
+
+
+
+imp_dt[model_id!="sm_m4",
+       ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement against sm_m4 [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(fdr_id~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+```
+
+
+Let's take the large decreases in skill out and inspect the average improvement again, to show these nodes aren't dominating the skill scores
+
+- here we will remove ids that are give under a -30% change in average forecast skill
+- the trend decrease in forecast skill of the KDE method is still apparent, showing that the outlier SMs aren't obscuring the overall change in forecast skill
+- however individual SM performance is clearly variable
+
+```{r fig.height=10,fig.width=15}
+
+
+filt_ids <- boot_data[,list(imp=(1-(mean(sm_kde_wdwe)/mean(sm_m4)))*100),by=.(id)][imp>-30,unique(id)]
+
+
+
+
+imp_dt <- eval_boot(melted_evaldt = boot_data[id%in%filt_ids],
+                    by_cols = c("fdr_id","id","kfold"),
+                    eval_cols = c("sm_m4","sm_kde_wdwe"),
+                    skillscore_b = "sm_m4")
+
+
+
+imp_dt[model_id!="sm_m4",
+       ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement against sm_m4 [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(fdr_id~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+rm(filt_ids)
+
+
+
+```
+
+Here, we inspect the fan plots to show the variable performance at the SM level
+
+
+```{r fig.height=10,fig.width=15}
+
+
+set.seed(1111)
+smp_ids <- pklcl_data[aggregation=="sm" & ss_id=="ss4",sample(unique(id),6)]
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+  
+
+par(mfrow=c(6,2))
+for(i in smp_ids){
+
+  
+plot(sm_gamlss_mqr$sm_m4[[i]],q50_line = TRUE,cols = colorRampPalette(c("gold", "red")),ylim=c(0,5),
+     main = paste0(i," --- sm_m4"," --- crps ---",eval_sm$crps_sm_m4[id==i,round(mean(sm_m4),4)]))
+lines(pklcl_data[id==i,demand])
+# eval_sm$crps_sm_m4[,mean(sm_m4)]
+
+
+plot(sm_kde_mqr$kde_wdwe[[i]],q50_line = TRUE,cols = colorRampPalette(c("gold", "red")),ylim=c(0,5),
+     main = paste0(i," --- sm_kde_wdwe"," --- crps ---",eval_sm$crps_sm_kde_wdwe[id==i,round(mean(sm_kde_wdwe),4)]))
+lines(pklcl_data[id==i,demand])
+
+}
+
+
+
+```
+
+However the KDE method fails when forecasting more complex resident peak demand, which is shown below for three nodes where the kde method shows a significant reduction in crps skill
+
+- the regression models are obviously capturing useful dynamics at these complex households
+- this is hard to capture with the KDE method as it is
+- could do some conditional KDE based on lagged measurement? or dynamic via a rolling window?
+
+
+## smart meter forecasting - all
+
+In this section we will apply the four best performing forecasting models across all smart meter IDs in the hierarchy
+
+We will apply two gamlss models and two kernel density estimation techniques
+
+- sm_bench, sm_m4, sm_kde_u, and sm_kde_wdwe
+- we will then look at the CRPS bootstrapped evaluation at the different substations and feeders
+
+
+```{r fig.height=10,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+######################### gamlss
+sm_models <- list()
+sm_models$sm_bench <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation=="sm"],
+                                  vars = c("demand","demandpk_l1","demandpk_l7"),
+                                  split_col = "id",
+                                  sort_cols = "date_time",
+                                  ncores = 8,
+                                  ncores_inner = 1,
+                                  formula = demand~demandpk_l1+demandpk_l7,
+                                  sigma.formula = ~1,
+                                  nu.formula = ~1,
+                                  tau.formula = ~1,
+                                  family = GB2,
+                                  parallel_inner = FALSE)
+
+unique(sapply(sm_models$sm_bench,function(x){class(x)[1]}))
+
+sm_models$sm_m4 <- ml_pc_gamlss(melted_dt = pklcl_data[aggregation=="sm"],
+                    vars = c("demand","demandpk_l1","demandpk_l7","doy_uk","dow_ftr","empty_h_l1"),
+                    split_col = "id",
+                    sort_cols = "date_time",
+                    ncores = 8,
+                    ncores_inner = 1,
+                    formula = demand~demandpk_l1+demandpk_l7+pb(doy_uk,control = pb.control(inter = 12),df=4)+ empty_h_l1 +dow_ftr,
+                    sigma.formula = ~ empty_h_l1,
+                    nu.formula = ~ empty_h_l1,
+                    tau.formula = ~1,
+                    family = GB2,
+                    parallel_inner = FALSE)
+
+unique(sapply(sm_models$sm_m4,function(x){class(x)[1]}))
+
+
+# sapply(sm_models$sm_bench,function(z){sum(sapply(z,function(x){x$converged}))})
+
+
+
+```
+
+
+
+convert to param/mqr objects
+
+```{r fig.height=10,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+
+
+sm_models_params <- lapply(sm_models,function(x){
+  
+  
+  ml_ppd2mqr(ppd_list = x,
+             melted_dt = pklcl_data[aggregation=="sm"],
+             split_col = "id",
+             sort_cols = "date_time",
+             params=TRUE)
+  
+  
+  
+})
+
+
+
+sm_models_mqr <- lapply(sm_models,function(x){
+  
+  
+  ml_ppd2mqr(ppd_list = x,
+             melted_dt = pklcl_data[aggregation=="sm"],
+             split_col = "id",
+             sort_cols = "date_time",
+             quantiles = seq(0.01,0.99,0.01))
+  
+  
+  
+})
+
+
+
+```
+
+
+Now fit the kde based models to all nodes
+
+
+
+```{r fig.height=10,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+######################################## kde
+
+
+sm_models$kde_u <- ml_kde(melted_dt = pklcl_data[aggregation=="sm"],
+                         target_var = "demand",
+                         split_col = "id",
+                         sort_cols = "date_time",
+                         ncores = 8L)
+
+sm_models_mqr$kde_u <- ml_kde2mqr(kde_list = sm_models$kde_u,
+                                   melted_dt = pklcl_data[aggregation=="sm"],
+                                   quantiles = seq(0.01,0.99,0.01),
+                                   split_col = "id",
+                                   sort_cols = "date_time")
+
+sm_models$kde_wdwe <- ml_kde(melted_dt = pklcl_data[aggregation=="sm"],
+                             target_var = "demand",
+                             split_col = "id",
+                             sort_cols = "date_time",
+                             ncores = 8L,
+                             by_var = "dow_ftr")
+
+sm_models_mqr$kde_wdwe <- ml_kde2mqr(kde_list = sm_models$kde_wdwe,
+                                    melted_dt = pklcl_data[aggregation=="sm"],
+                                    quantiles = seq(0.01,0.99,0.01),
+                                    split_col = "id",
+                                    sort_cols = "date_time",
+                                    by_var = "dow_ftr")
+
+
+
+```
+
+
+- note that the crps improvement here is for smart meter forecasts, but it is grouped average improvement of all SMs at each feeder
+- the plot is quite busy, but contains evaluation comparisons at all substations and feeders for the 5 secondary substations etc.
+- the main takeaway is that the gamlss model gives significant improvements in skill vrs. the kde model in both CV and testing when grouped at the feeder level
+
+
+
+```{r fig.height=10,fig.width=15,message=FALSE,warning=FALSE,results='hide'}
+ # Initiate cluster
+cl <- makeCluster(4)
+registerDoSNOW(cl)
+#set up progress bar
+iterations <- 4
+pb <- txtProgressBar(max = iterations, style = 3)
+progress <- function(n) setTxtProgressBar(pb, n)
+opts <- list(progress = progress)
+
+# evaluate each model id
+eval_sm_models <- foreach(x = names(sm_models_mqr),.packages = c("data.table"),.options.snow = opts) %dopar% {
+          
+  crps <- rbindlist(ml_crps_mqr(mqr_list = sm_models_mqr[[x]],
+                               melted_dt = pklcl_data[aggregation=="sm"],
+                               method="kde",
+                               mod_name = x,
+                               sort_cols = c("date_uk","ss_id","fdr_id")),idcol = "id")
+
+  crps[kfold!="Test",kfold:="All_cv"]
+  
+  return(crps)
+  
+}
+
+names(eval_sm_models) <- paste0("crps_",names(sm_models_mqr))
+        
+close(pb)
+stopCluster(cl)
+rm(cl,iterations,progress,opts)
+
+
+
+
+
+boot_data <- cbind(eval_sm_models$crps_sm_bench,eval_sm_models$crps_sm_m4[,.(sm_m4)],
+                   eval_sm_models$crps_kde_u[,.(kde_u)],eval_sm_models$crps_kde_wdwe[,.(kde_wdwe)])
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("ss_id","fdr_id","kfold"),
+                     eval_cols = c("sm_bench","sm_m4","kde_u","kde_wdwe"),
+                     skillscore_b = "sm_bench")
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(fdr_id~ss_id+kfold, scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+```
+
+Let's summarize this plot more succinctly.
+
+The next plot takes bootstrap score averages of the crps, for each smart meter forecast when grouped at the secondary substation level
+
+- the resulting superior skill of the gamlss model is clearer at this grouping level
+- the improvement is clearer and has less uncertainty because we are looking at a much larger sample size for each bootstrap average
+
+```{r fig.height=7.5,fig.width=15}
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("ss_id","kfold"),
+                     eval_cols = c("sm_bench","sm_m4","kde_u","kde_wdwe"),
+                     skillscore_b = "sm_bench")
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement [%]")
+        +geom_boxplot()
+        +facet_grid(ss_id~kfold, scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+```
+
+
+Finally, here we plot the CRPS improvement of the advanced gamlss model (sm_m4) over the advanced kde benchmark (kde_wdwe) at the resident level, i.e. individually
+
+- Again we see here that, generally there is trend of a positive improvement at the individual level, as expected due to the previous two plots
+- however at an individual level, there is some variability, and KDE forecasts are better at a few nodes, or there is no significant difference
+- there is also a higher range of uncertainty in the CRPS improvement due to the smaller sample size at the individual meter level
+- summary: at the smart meter level of resolution, the results are complicated and node dependent due to the different characteristics of the individual time series
+- However, there is a clear trend showing the superiority of the gamlss forecasting model when considering average performance of a collection of smart meters.
+
+
+```{r fig.height=50,fig.width=15}
+
+
+imp_dt <- eval_boot(melted_evaldt = boot_data,
+                    by_cols = c("ss_id","fdr_id","id","kfold"),
+                    eval_cols = c("sm_m4","kde_wdwe"),
+                    skillscore_b = "kde_wdwe")
+
+
+
+
+imp_dt[model_id=="sm_m4",
+       ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement against kde_wdwe [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(ss_id+fdr_id~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+```
+
+FInally, let's compare the fan plots of the density forecasts at a few sampled households
+
+- here we are comparing the sm_m4 (left column) and kde_wdwe (right column) forecasts
+- the average CRPS during CV is printed above each plot along with node ID
+- note again here, the widest interval has a 98% coverage probability
+- again here, we see a range of behaviours of peak demand, some showing strong weekly patterns, others not etc.
+
+
+```{r fig.height=20,fig.width=15}
+
+
+set.seed(1)
+# smp_ids <- c("N0557","N0894","N2418")
+smp_ids <- pklcl_data[aggregation=="sm",sample(unique(id),12)]
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+
+
+par(mfrow=c(length(smp_ids),2))
+for(i in smp_ids){
+
+  
+plot(sm_models_mqr$sm_m4[[i]],q50_line = TRUE,cols = colorRampPalette(c("gold", "red")),ylim=c(0,5),
+     main = paste0(i," --- sm_m4"," --- av. crps during CV =",eval_sm_models$crps_sm_m4[id==i,round(mean(sm_m4),4)]))
+lines(pklcl_data[id==i,demand])
+# eval_sm$crps_sm_m4[,mean(sm_m4)]
+
+
+plot(sm_models_mqr$kde_wdwe[[i]],q50_line = TRUE,cols = colorRampPalette(c("gold", "red")),ylim=c(0,5),
+     main = paste0(i," --- sm_kde_wdwe"," --- av. crps during CV = ",eval_sm_models$crps_kde_wdwe[id==i,round(mean(kde_wdwe),4)]))
+lines(pklcl_data[id==i,demand])
+
+}
+
+
+
+```
+
+# session info & save outputs
+
+```{r}
+
+nms <- c("agg_bench","agg_m1","agg_m2","agg_m3")
+agg_models <- list(agg_bench,agg_m1,agg_m2,agg_m3)
+agg_models_mqr <- list(agg_bench_mqr,agg_m1_mqr,agg_m2_mqr,agg_m3_mqr)
+
+names(agg_models) <- nms
+names(agg_models_mqr) <- nms
+
+eval_agg_models <- eval_agg
+
+
+s_file <- FALSE
+if(s_file | !file.exists(paste0(data_save,"intensity_smfc_outv2.rda"))){
+save(agg_models,agg_models_mqr,eval_agg_models,
+     sm_models,sm_models_mqr,eval_sm_models,file = paste0(data_save,"intensity_smfc_outv2.rda"))
+}
+
+
+
+sessionInfo()
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

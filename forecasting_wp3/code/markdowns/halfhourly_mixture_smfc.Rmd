@@ -1,0 +1,1543 @@
+---
+title: "Amidine --- Day ahead half-hourly forecasting - mixture/blend"
+author: "Ciaran Gilbert"
+date: "`r format(Sys.Date(),'%d-%m-%Y')`"
+output:
+  html_document:
+    code_folding: show
+    theme: united
+    number_sections: true
+    toc: true
+---
+
+<style>
+.main-container {
+    max-width: 1200px !important;
+}
+pre {
+  overflow-x: auto;
+}
+pre code {
+  word-wrap: normal;
+  white-space: pre;
+}
+</style>
+
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 800)
+```
+
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(
+ fig.width=15,fig.height=5,fig.align="center"
+)
+```
+
+
+First some required packages and functions for plotting/importing data
+
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+# options(repos='http://cran.rstudio.com/') ##restart?
+
+packages <- c("rmarkdown","cli","data.table","ggplot2","mgcv",
+              "gifski")
+
+install.packages(setdiff(packages, rownames(installed.packages())))
+
+rm(list=ls())
+
+library(data.table)
+library(ggplot2)
+library(ProbCast)
+
+data_save <- "../../saved_data/"
+
+# include utility functions
+source("../utils/amidine_utils.R")
+
+ncores <- parallel::detectCores()
+
+
+
+
+```
+
+Now let's load the data from the data exploration and preparation document
+
+
+```{r}
+
+load(paste0(data_save,"prep_expl_smfc_outv2.rda"))
+
+hier_ref
+
+
+```
+
+
+
+Here we engineer features used in the half hourly forecasting regression tasks so we can recover the same dataset
+
+
+```{r}
+
+
+
+## lagged peak
+lcl_data[peak_ind==1,demandpk_l1:=shift(demand,n=1L),by=.(id)]
+lcl_data[peak_ind==1,demandpk_l7:=shift(demand,n=7L),by=.(id)]
+
+
+## lagged daily variance
+lcl_data[,dvar_demand:=var(demand),by=.(date_uk,id)]
+lcl_data[peak_ind==1,dvar_demand_l1:=shift(dvar_demand,n=1L),by=.(id)]
+# lcl _data[peak_ind==1,dvar_demand_l7:=shift(dvar_demand,n=7L),by=.(id)]
+
+## weekday/weekend feature
+lcl_data[,dow_ftr:=1]
+lcl_data[dow_uk%in%c(1,7),dow_ftr:=0]
+lcl_data[,dow_ftr := factor(dow_ftr)]
+
+
+pklcl_data <- lcl_data[peak_ind==1]
+
+pklcl_data[,empty_h:=0]
+pklcl_data[dvar_demand<=0.001,empty_h:=1]
+
+
+# run-length encoding for blocks of 'emptyness'
+pklcl_data[,grp:=rleid(empty_h),by=.(id)]
+
+# set a minimum of 7 days for a block to be defined empty
+empty_grp <- pklcl_data[empty_h==1,.N,by=.(id,grp)][N>=7]
+
+# redifine the empty indicator to be only these blocks
+pklcl_data[,empty_h:=0]
+for(i in unique(empty_grp$id)){
+  
+  
+  pklcl_data[id==i & grp%in%empty_grp[id==i,grp],empty_h:=1]
+  
+  
+}
+
+# set nodes which have <1 month of empty data to zero, see comment
+pklcl_data[id%in%pklcl_data[empty_h==1,.N,by=.(id)][N<31]$id,empty_h:=0]
+
+# shift for prediction
+pklcl_data[,empty_h_l1:=shift(empty_h,n=1L,fill = empty_h[1L]),by=.(id)]
+
+
+pklcl_data[,empty_h:=as.factor(empty_h)]
+pklcl_data[,empty_h_l1:=as.factor(empty_h_l1)]
+
+
+pklcl_data <- na.omit(pklcl_data)
+
+
+
+```
+
+
+
+```{r}
+
+load(paste0(data_save,"prep_expl_smfc_outv2.rda"))
+
+hier_ref
+
+
+```
+
+
+
+Here we engineer features used in the half hourly forecasting regression tasks so we can recover the same dataset
+
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+## lagged values
+lcl_data[,demand_l1d:=shift(demand,n=48L),by=.(id)]
+lcl_data[,demand_l7d:=shift(demand,n=48*7),by=.(id)]
+
+
+lcl_data[,dow_ftr:="weekday"]
+lcl_data[dow_uk==1,dow_ftr:="sunday"]
+lcl_data[dow_uk==7,dow_ftr:="saturday"]
+lcl_data[,dow_ftr:=factor(dow_ftr)]
+
+
+min_d <- lcl_data[demand!=0,min(demand)]
+lcl_data[demand==0,demand:=min_d/10]
+
+
+
+lcl_data[,tod_ftr:=factor(paste0("tod_",tod_uk))]
+lcl_data[,toddow_ftr:=factor(paste0("tod_",tod_uk,"_",as.character(dow_ftr)))]
+
+
+lcl_data[,dow_uk:=factor(dow_uk)]
+lcl_data[,moy_uk:=factor(moy_uk)]
+
+## lagged peak
+lcl_data[peak_ind==1,demandpk_l1d:=shift(demand,n=1L),by=.(id)]
+lcl_data[peak_ind==1,demandpk_l7d:=shift(demand,n=7L),by=.(id)]
+
+
+lcl_data[,demandpk_l1d:=nafill(nafill(demandpk_l1d,type = "locf",nan = NA),
+                              type = "nocb",nan = NA),by=.(id,date_uk)]
+lcl_data[,demandpk_l7d:=nafill(nafill(demandpk_l7d,type = "locf",nan = NA),
+                              type = "nocb",nan = NA),by=.(id,date_uk)]
+
+
+
+
+lcl_data <- na.omit(lcl_data)
+
+
+
+ggplot(data=lcl_data[aggregation=="ps"],aes(x=date_time,y=demand))+
+  labs(y = "demand [kWh]",x = "time [uk]")+
+  geom_point(size=0.1,colour="steelblue",alpha=.5)+
+  facet_wrap(~aggregation,nrow=1,scales = "free")
+
+
+
+
+
+```
+
+The task at hand here is to predict the energy demand at the day-ahead horizon
+
+We will start by chopping the data into 3 folds. We have 2 folds for cross validation and one for testing, obviously we don't have a very big dataset for estimation and evaluation. Therefore quantifying the uncertainty in evaluation metrics will be key.
+
+- we will divide each month into three fold chunks and take them as our folds, using the third chunk as our blind testing data
+
+```{r}
+
+
+
+lcl_data[,kfold:=paste0("fold",ceiling(as.integer(format(date_uk,"%d"))/10))]
+lcl_data[kfold=="fold4",kfold:="fold1"]
+lcl_data[kfold=="fold3",kfold:="Test"]
+
+
+pklcl_data[,kfold:=paste0("fold",ceiling(as.integer(format(date_uk,"%d"))/10))]
+pklcl_data[kfold=="fold4",kfold:="fold1"]
+pklcl_data[kfold=="fold3",kfold:="Test"]
+
+
+# file.exists(paste0(data_save,"halfhourly_smfc_out.rda")
+
+
+```
+
+
+load existing forecasts from peak forecasting workbooks
+
+- these models correspond to the ones highlighted in the accompanying paper
+
+
+```{r}
+
+## from intensity work
+load(paste0(data_save,"intensity_smfc_outv2.rda"))
+pk_i_sm_model <- sm_models$sm_m4
+pk_i_agg_model <- agg_models$agg_m3
+
+rm(agg_models,agg_models_mqr,eval_agg_models,
+   eval_sm_models,sm_models,sm_models_mqr,empty_grp)
+invisible(gc())
+
+
+
+## from timing work
+load(paste0(data_save,"timing_smfc_outv2.rda"))
+pk_t_sm_model <- sm_models$m4
+pk_t_agg_model <- agg_models$m8
+
+rm(agg_models,eval_agg,eval_agg_rel,sm_models,eval_sm,eval_sm_rel)
+invisible(gc())
+
+
+
+```
+
+
+load existing forecasts from peak forecasting workbooks
+
+```{r}
+
+## from half hourly work
+load(paste0(data_save,"halfhourly_smfc_out.rda"))
+# hh_agg_model <- hh_agg_models$m5
+# hh_sm_model <- hh_sm_models$m7
+# 
+# rm(hh_agg_models,hh_sm_models)
+# invisible(gc())
+
+
+```
+
+
+
+```{r echo = FALSE, message=FALSE, warning=FALSE, results='hide'}
+
+
+# hh_agg_model$ps1
+
+pk_i_agg_model <- ml_ppd2ppd_lite(ppd_list = pk_i_agg_model,
+                                  melted_dt = pklcl_data[aggregation!="sm"],
+                                  split_col = "id",
+                                  sort_cols = "date_time")
+
+
+pk_i_sm_model <- ml_ppd2ppd_lite(ppd_list = pk_i_sm_model,
+                                 melted_dt = pklcl_data[aggregation=="sm"],
+                                 split_col = "id",
+                                 sort_cols = "date_time")
+
+
+
+
+invisible(gc())
+
+
+print(":)")
+
+
+
+```
+
+Get pk intensity forecasts to long format, i.e. 48 forecasts per day, note that the number of repeated indexes changes at the beginning/end of BST to 46/50 respectively
+
+```{r}
+
+nodes <- names(pk_i_agg_model)
+hh_agg_models$peak <- lapply(nodes,function(x){
+  
+  pk_repeat(model = pk_i_agg_model[[x]],
+            repeat_vec = lcl_data[id==x,.N,by=.(date_uk)][,N])
+
+})
+names(hh_agg_models$peak) <- nodes
+
+
+nodes <- names(pk_i_sm_model)
+hh_sm_models$peak <- lapply(nodes,function(x){
+  
+  pk_repeat(model = pk_i_sm_model[[x]],
+            repeat_vec = lcl_data[id==x,.N,by=.(date_uk)][,N])
+
+})
+names(hh_sm_models$peak) <- nodes
+
+
+
+```
+
+
+
+
+
+
+get the timing probability forecasts, i.e. weights of the mixture
+
+
+
+```{r}
+
+
+nodes <- names(pk_t_agg_model)
+pk_t_agg_model <- lapply(nodes,function(x){
+  
+  extract_prob(model = pk_t_agg_model[[x]],
+               data_long = lcl_data[id==x])
+
+})
+names(pk_t_agg_model) <- nodes
+
+
+nodes <- names(pk_t_sm_model)
+pk_t_sm_model <- lapply(nodes,function(x){
+  
+  extract_prob(model = pk_t_sm_model[[x]],
+               data_long = lcl_data[id==x])
+
+})
+names(pk_t_sm_model) <- nodes
+
+# 
+# plot(pk_t_agg_model$ps1[1:50],ylim=c(0,.5))
+# plot(pk_t_agg_model$ss1_fdr4[1:50],ylim=c(0,.5))
+# plot(pk_t_sm_model$N0000[1:50],ylim=c(0,.5))
+
+
+```
+
+
+
+Now define the expert mixture models, as beta transformed linear pool. In this case we need
+
+- typical day ahead forecast
+- peak forecast at at each time, these will be the same within day
+- weighting, which in our case is the probability of a peak occurring at each time stamp
+- we take `m7` at the smart meter level from the previous day ahead work, and `m8` from the aggregated level models
+
+
+
+```{r}
+
+nodes <- names(hh_agg_models$bench)
+hh_agg_models$blend <- lapply(nodes,function(x){
+  
+  exp_mixture(mod_da = hh_agg_models$m8[[x]],
+              mod_pk = hh_agg_models$peak[[x]],
+              weight_pk = pk_t_agg_model[[x]])
+  
+})
+
+names(hh_agg_models$blend) <- nodes
+
+
+nodes <- names(hh_sm_models$bench_tod)
+hh_sm_models$blend <- lapply(nodes,function(x){
+  
+  exp_mixture(mod_da = hh_sm_models$m7[[x]],
+              mod_pk = hh_sm_models$peak[[x]],
+              weight_pk = pk_t_sm_model[[x]])
+  
+})
+
+names(hh_sm_models$blend) <- nodes
+
+```
+
+
+Now define the expert mixture models with **optimised parameters for the BTLP**. In this case we need to supply the data as well for MLE
+
+
+```{r}
+t1 <- proc.time()
+nodes <- names(hh_agg_models$bench)
+hh_agg_models$blend_opt <- lapply(nodes,function(x){
+
+  exp_mixture(mod_da = hh_agg_models$m8[[x]],
+              mod_pk = hh_agg_models$peak[[x]],
+              weight_pk = pk_t_agg_model[[x]],
+              optimise_btlp = TRUE,
+              data = lcl_data[id==x,.(kfold,demand)])
+
+})
+print(proc.time()-t1)
+
+names(hh_agg_models$blend_opt) <- nodes
+
+t1 <- proc.time()
+nodes <- names(hh_sm_models$bench_tod)
+hh_sm_models$blend_opt <- lapply(nodes,function(x){
+
+  exp_mixture(mod_da = hh_sm_models$m7[[x]],
+              mod_pk = hh_sm_models$peak[[x]],
+              weight_pk = pk_t_sm_model[[x]],
+              optimise_btlp = TRUE,
+              data = lcl_data[id==x,.(kfold,demand)])
+
+})
+print(proc.time()-t1)
+
+names(hh_sm_models$blend_opt) <- nodes
+
+```
+
+
+Now define the expert mixture models with **optimised parameters for the BTLP for each half hour**. In this case we need to supply the data and hour index for MLE
+
+
+
+```{r}
+
+t1 <- proc.time()
+nodes <- names(hh_agg_models$bench)
+hh_agg_models$blend_opthh <- lapply(nodes,function(x){
+
+  exp_mixture(mod_da = hh_agg_models$m8[[x]],
+              mod_pk = hh_agg_models$peak[[x]],
+              weight_pk = pk_t_agg_model[[x]],
+              optimise_btlp = TRUE,
+              data = lcl_data[id==x,.(kfold,demand,tod_uk)],
+              hh_opt = TRUE)
+
+})
+print(proc.time()-t1)
+
+names(hh_agg_models$blend_opthh) <- nodes
+
+
+t1 <- proc.time()
+nodes <- names(hh_sm_models$bench_tod)
+hh_sm_models$blend_opthh <- lapply(nodes,function(x){
+
+  exp_mixture(mod_da = hh_sm_models$m7[[x]],
+              mod_pk = hh_sm_models$peak[[x]],
+              weight_pk = pk_t_sm_model[[x]],
+              optimise_btlp = TRUE,
+              data = lcl_data[id==x,.(kfold,demand,tod_uk)],
+              hh_opt = TRUE)
+
+})
+print(proc.time()-t1)
+
+names(hh_sm_models$blend_opthh) <- nodes
+
+
+```
+
+
+
+
+
+```{r}
+
+rm(pk_i_agg_model,pk_i_sm_model,
+   pk_t_agg_model,pk_t_sm_model,
+   pklcl_data)
+invisible(gc())
+
+```
+
+Here are example forecasts at the `ps1` level
+
+
+
+```{r animation.hook="gifski", interval = 0.5, warning = FALSE, results='hide'}
+
+  
+
+t1 <- proc.time()
+mqr1 <- as.MultiQR.ppd_lite(hh_agg_models$m8$ps1,
+                            quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+t1 <- proc.time()
+mqr2 <- as.MultiQR.exp_mixture(object = hh_agg_models$blend$ps1,
+                               quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+t1 <- proc.time()
+mqr3 <- as.MultiQR.exp_mixture(object = hh_agg_models$blend_opt$ps1,
+                               quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+t1 <- proc.time()
+mqr4 <- as.MultiQR.exp_mixture(object = hh_agg_models$blend_opthh$ps1,
+                               quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+
+
+
+plot(mqr1[1:500,],ylim=lcl_data[id=="ps1",range(demand)], main = "ps1 - day ahead m8")
+plot(mqr2[1:500,],ylim=lcl_data[id=="ps1",range(demand)], main = "ps1 - day ahead blend")
+plot(mqr3[1:500,],ylim=lcl_data[id=="ps1",range(demand)], main = "ps1 - day ahead blend_opt")
+plot(mqr4[1:500,],ylim=lcl_data[id=="ps1",range(demand)], main = "ps1 - day ahead blend_opthh")
+
+
+```
+
+
+Here are example forecasts at `ss1_fd4`
+
+
+```{r animation.hook="gifski", interval = 0.5, warning = FALSE, results='hide'}
+
+t1 <- proc.time()
+mqr1 <- as.MultiQR.ppd_lite(hh_agg_models$m8$ss1_fdr4,
+                            quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+t1 <- proc.time()
+mqr2 <- as.MultiQR.exp_mixture(object = hh_agg_models$blend$ss1_fdr4,
+                               quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+t1 <- proc.time()
+mqr3 <- as.MultiQR.exp_mixture(object = hh_agg_models$blend_opt$ss1_fdr4,
+                               quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+t1 <- proc.time()
+mqr4 <- as.MultiQR.exp_mixture(object = hh_agg_models$blend_opthh$ss1_fdr4,
+                               quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+
+
+plot(mqr1[1:500,],ylim=lcl_data[id=="ss1_fdr4",range(demand)], main = "ss1_fdr4 - day ahead m5")
+plot(mqr2[1:500,],ylim=lcl_data[id=="ss1_fdr4",range(demand)], main = "ss1_fdr4 - day ahead blend")
+plot(mqr3[1:500,],ylim=lcl_data[id=="ss1_fdr4",range(demand)], main = "ss1_fdr4 - day ahead blend_opt")
+plot(mqr4[1:500,],ylim=lcl_data[id=="ss1_fdr4",range(demand)], main = "ss1_fdr4 - day ahead blend_opthh")
+
+```
+
+Here are example forecasts at `N0000`
+
+```{r animation.hook="gifski", interval = 0.5, warning = FALSE, results='hide'}
+
+t1 <- proc.time()
+mqr1 <- as.MultiQR.ppd_lite(hh_sm_models$m7$N0000,
+                            quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+t1 <- proc.time()
+mqr2 <- as.MultiQR.exp_mixture(object = hh_sm_models$blend$N0000,
+                               quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+t1 <- proc.time()
+mqr3 <- as.MultiQR.exp_mixture(object = hh_sm_models$blend_opt$N0000,
+                               quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+t1 <- proc.time()
+mqr4 <- as.MultiQR.exp_mixture(object = hh_sm_models$blend_opthh$N0000,
+                               quantiles = seq(0.01,0.99,0.01))
+print(proc.time()-t1)
+
+
+plot(mqr1[1:500,],ylim=lcl_data[id=="N0000",range(demand)], main = "N0000 - day ahead m7")
+plot(mqr2[1:500,],ylim=lcl_data[id=="N0000",range(demand)], main = "N0000 - day ahead blend")
+plot(mqr3[1:500,],ylim=lcl_data[id=="N0000",range(demand)], main = "N0000 - day ahead blend_opt")
+plot(mqr4[1:500,],ylim=lcl_data[id=="N0000",range(demand)], main = "N0000 - day ahead blend_opthh")
+
+
+```
+
+# Aggregate levels
+
+
+Now here is an example over 7 days of the blending process
+
+- top left we have the original day ahead forecasts
+- top right we have the specialised peak forecast
+= bottom left we have the expert mixture, or blended forecast.
+- bottom right are the weights applied to the peak forecast at each half hour in the lead time
+
+
+
+```{r animation.hook="gifski", interval = 0.5, warning = FALSE, results='hide'}
+
+
+set.seed(2)
+sample_ids <- "ps1"
+date_oi  <- lcl_data[,sample(unique(date_uk),1)]
+date_oi <- date_oi+1:7*60*60*24
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+
+  
+for(j in seq_along(date_oi)){
+  par(mfrow=c(2,2))
+  for(i in sample_ids){
+    
+    
+    inds <- lcl_data[id==i][date_uk==date_oi[j],which=T]
+    mqr_tmp <-  as.MultiQR.ppd_lite(object = hh_agg_models$blend[[i]]$mod_da,
+                                    quantiles = seq(0.01,0.99,0.01),
+                                    index = inds)
+    # hh day ahead
+    plot(mqr_tmp,q50_line = TRUE,
+         main=paste0(i," --- hh --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=lcl_data[id==i,range(demand)])
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+    
+    
+    
+    mqr_tmp2 <-  as.MultiQR.ppd_lite(hh_agg_models$blend[[i]]$mod_pk,
+                                    quantiles = seq(0.01,0.99,0.01),
+                                    index = inds)
+    # 
+    plot(mqr_tmp2,q50_line = TRUE,
+         main=paste0(i," --- pk --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=lcl_data[id==i,range(demand)])
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+    
+    
+    mqr_blend <- as.MultiQR.exp_mixture(object = hh_agg_models$blend[[i]],
+                                        quantiles = seq(0.01,0.99,0.01),
+                                        index = inds)
+    
+    
+    plot(mqr_blend,q50_line = TRUE,
+         main=paste0(i," --- blend --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=lcl_data[id==i,range(demand)])
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+    
+    barplot(hh_agg_models$blend[[i]]$weight_pk[inds],col=2,ylab="prob of peak [-]",xlab = "time of day [-]",ylim=c(0,.75))
+
+
+    
+    
+  }
+  
+  
+  
+}
+
+
+rm(mqr_blend,mqr_tmp,mqr_tmp2,mqr1,mqr2,mqr3,mqr4)
+invisible(gc())
+
+
+
+```
+
+
+Let's now evaluate the two new forecasts at the aggregate level. We will evaluate
+
+- `peak` is the bespoke daily peak intensity forecast - this is the same at each half hour of the day
+- `blend` is the expert mixture of the distributions weighted by the peak timing probability
+
+
+Let's looks at the CRPS
+
+- obviously the `peak` forecast is rubbish during all the lead times (:
+
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+t1 <- proc.time() 
+hh_agg_eval$peak <- rbindlist(ml_crps_mods(mod_list = hh_agg_models$peak,
+                                           melted_dt = lcl_data[aggregation!="sm"],
+                                           sort_cols = c("aggregation","date_time"),
+                                           quantiles = seq(0.01,0.99,0.01)),
+                              idcol = "id")
+print(proc.time()-t1)
+
+## takes about 10 mins...
+t1 <- proc.time() 
+hh_agg_eval$blend <- rbindlist(ml_crps_mods(mod_list = hh_agg_models$blend,
+                                           melted_dt = lcl_data[aggregation!="sm"],
+                                           sort_cols = c("aggregation","date_time"),
+                                           quantiles = seq(0.01,0.99,0.01)),
+                              idcol = "id")
+print(proc.time()-t1)
+
+
+
+## takes about 10 mins...
+t1 <- proc.time()
+hh_agg_eval$blend_opt <- rbindlist(ml_crps_mods(mod_list = hh_agg_models$blend_opt,
+                                           melted_dt = lcl_data[aggregation!="sm"],
+                                           sort_cols = c("aggregation","date_time"),
+                                           quantiles = seq(0.01,0.99,0.01)),
+                              idcol = "id")
+print(proc.time()-t1)
+
+
+
+## takes about 10 mins...
+t1 <- proc.time()
+hh_agg_eval$blend_opthh <- rbindlist(ml_crps_mods(mod_list = hh_agg_models$blend_opthh,
+                                           melted_dt = lcl_data[aggregation!="sm"],
+                                           sort_cols = c("aggregation","date_time"),
+                                           quantiles = seq(0.01,0.99,0.01)),
+                              idcol = "id")
+print(proc.time()-t1)
+
+
+
+
+
+
+hh_agg_eval$peak[kfold!="Test",kfold:="All_cv"]
+hh_agg_eval$blend[kfold!="Test",kfold:="All_cv"]
+hh_agg_eval$blend_opt[kfold!="Test",kfold:="All_cv"]
+hh_agg_eval$blend_opthh[kfold!="Test",kfold:="All_cv"]
+#   
+
+
+boot_data <- cbind(hh_agg_eval$bench,
+                   hh_agg_eval$m8[,.(m8=crps)],
+                   hh_agg_eval$peak[,.(peak=crps)],
+                   hh_agg_eval$blend[,.(blend=crps)],
+                   hh_agg_eval$blend_opt[,.(blend2=crps)],
+                   hh_agg_eval$blend_opthh[,.(blend3=crps)])
+
+setnames(boot_data,"crps","bench")
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold)
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+```
+
+
+
+
+Let's exclude the `peak` model for now
+
+- the `blend` model looks to be more skilful than the `m5` model - nice! by about 1% or so tho
+- the optimised `blend2` and `blend3` models doesn't seem to help during CV, enough data? also conditions for BTLP?
+
+
+```{r}
+
+
+boot_dt[!model_id%in%c("peak"),ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+Here is the skill scores of `blend` against the `bench` model at the different nodes.
+
+
+```{r fig.height = 7.5}
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","id","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+
+boot_dt[model_id=="blend",ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement over m8 [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(aggregation~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+
+Let's just now evaluate during the peak hours
+
+- nice (: this is the result I was hoping for
+- note that the `peak` model is the upper limit of the skill if we had perfect knowledge of **when** the peaks will occur
+
+```{r}
+
+
+
+boot_data <- boot_data[lcl_data[aggregation!="sm",.(id,date_time,peak_ind)],on=.(id,date_time)]
+boot_data <- boot_data[peak_ind==1]
+boot_data[,peak_ind:=NULL]
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales="free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+```
+
+
+
+Let's have exclude the `peak` model for now
+
+- our forecasts are more skilful during peak hours by around 10-15\%  \o/
+- note that the skill seems to reduce at the lower aggregations because it's more difficult to forecast **when** the peak will occur at this level
+
+```{r}
+
+
+boot_dt[!model_id%in%c("peak"),ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales="free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+here is the skill scores at the different nodes 
+
+- v nice! (:
+- the skill scores seem to on average reduce at the lower voltages during cross validation
+- this has to be due to the decreasing skill of the **peak timing forecasts**
+- interestingly during testing all the models tend to an improvement of around 10\%
+
+```{r fig.height = 7.5}
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","id","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench")
+
+
+boot_dt[model_id=="blend",ggplot(data=.SD, aes(x=id,y=score)) + labs(y = "crps improvement over bench [%]")
+        +geom_boxplot()
+        +coord_flip()
+        +facet_grid(aggregation~kfold+model_id,scales = "free_y",space = "free_y")
+        +theme(axis.text.y = element_text(size=10,angle = 30, vjust = 0.5, hjust=1))
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+
+
+PIT
+
+```{r}
+
+
+hh_agg_eval_pit <- lapply(names(hh_agg_models),function(x){
+  
+  rbindlist(lapply(names(hh_agg_models[[x]]),function(y){
+    
+  
+    pit_out <- lcl_data[id==y,.(id,aggregation,date_time,peak_ind,kfold,demand)]
+    pit_out[,pit := PIT(hh_agg_models[[x]][[y]],obs = demand)]
+    pit_out[,demand:=NULL]
+    pit_out[kfold!="Test",kfold:="All_cv"]
+
+  }))
+  
+  
+})
+names(hh_agg_eval_pit) <- names(hh_agg_models)
+
+hh_agg_eval_pit <- rbindlist(hh_agg_eval_pit,idcol = "model_id")
+
+
+quick_hist <- function(values_vec,...) {
+    res <- hist(values_vec, plot=FALSE, ...)
+
+    dat <- data.frame(xmin=head(res$breaks, -1L),
+                      xmax=tail(res$breaks, -1L),
+                      ymin=0.0,
+                      ymax=res$density)
+}
+
+
+
+temp <- hh_agg_eval_pit[,as.list(quick_hist(pit, breaks=20)),by=.(aggregation,kfold,model_id)]
+
+temp[,model_id:=factor(model_id,levels = names(hh_agg_models))]
+
+ggplot(data=temp[!model_id%in%c("m5","m7","peak")], aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)) +
+  labs(y = "density [-]", x = " probability level") +
+  geom_rect(fill = "grey75",color = "white")+
+  geom_hline(aes(yintercept = 1,colour = "ideal"), linetype = "dashed")+
+  facet_grid(aggregation~kfold+model_id, scales = "free_y")+
+  theme(legend.position="top")
+
+
+
+
+```
+
+PITS only during peaks and including also the `peak` model
+
+
+```{r}
+
+
+temp <- hh_agg_eval_pit[peak_ind==1,as.list(quick_hist(pit, breaks=20)),by=.(aggregation,kfold,model_id)]
+
+temp[,model_id:=factor(model_id,levels = names(hh_agg_models))]
+
+ggplot(data=temp[!model_id%in%c("m5","m7","bench")], aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)) +
+  labs(y = "density [-]", x = " probability level") +
+  geom_rect(fill = "grey75",color = "white")+
+  geom_hline(aes(yintercept = 1,colour = "ideal"), linetype = "dashed")+
+  facet_grid(aggregation~kfold+model_id, scales = "free_y")+
+  theme(legend.position="top")
+
+
+
+
+
+
+
+```
+
+
+
+
+
+# Household level
+
+
+
+Now here is an example over 7 days of the blending process
+
+- top left we have the original day ahead forecasts
+- top right we have the specialised peak forecast
+- bottom left we have the expert mixture, or blended forecast.
+- bottom right are the weights applied to the peak forecast at each half hour in the lead time
+
+
+
+```{r animation.hook="gifski", interval = 0.5, warning = FALSE, results='hide'}
+
+
+set.seed(2)
+sample_ids <- "N0000"
+date_oi  <- lcl_data[,sample(unique(date_uk),1)]
+date_oi <- date_oi+1:7*60*60*24
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+
+  
+for(j in seq_along(date_oi)){
+  par(mfrow=c(2,2))
+  for(i in sample_ids){
+    
+    
+    inds <- lcl_data[id==i][date_uk==date_oi[j],which=T]
+    mqr_tmp <-  as.MultiQR.ppd_lite(object = hh_sm_models$blend[[i]]$mod_da,
+                                    quantiles = seq(0.01,0.99,0.01),
+                                    index = inds)
+    # hh day ahead
+    plot(mqr_tmp,q50_line = TRUE,
+         main=paste0(i," --- hh --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=lcl_data[id==i,range(demand)])
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+    
+    
+    
+    mqr_tmp2 <-  as.MultiQR.ppd_lite(hh_sm_models$blend[[i]]$mod_pk,
+                                    quantiles = seq(0.01,0.99,0.01),
+                                    index = inds)
+    # 
+    plot(mqr_tmp2,q50_line = TRUE,
+         main=paste0(i," --- pk --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=lcl_data[id==i,range(demand)])
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+    
+    
+    mqr_blend <- as.MultiQR.exp_mixture(object = hh_sm_models$blend[[i]],
+                                        quantiles = seq(0.01,0.99,0.01),
+                                        index = inds)
+    
+    
+    plot(mqr_blend,q50_line = TRUE,
+         main=paste0(i," --- blend --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=lcl_data[id==i,range(demand)])
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+    
+    barplot(hh_sm_models$blend[[i]]$weight_pk[inds],col=2,ylab="prob of peak [-]",xlab = "time of day [-]",ylim=c(0,.1))
+
+
+    
+    
+  }
+  
+  
+  
+}
+
+
+rm(mqr_blend,mqr_tmp,mqr_tmp2,mqr1,mqr2,mqr3,mqr4,
+   temp,temprel,test,boot_data, boot_dt)
+invisible(gc())
+
+
+
+```
+
+
+Let's now evaluate the new forecasts at the household level. We will evaluate
+
+- `peak` is the bespoke daily peak intensity forecast - this is the same at each half hour of the day
+- `blend` is the expert mixture of the distributions weighted by the peak timing probability
+
+
+Let's looks at the CRPS
+
+- obviously the `peak` forecast is rubbish during all the lead times (:
+
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+load(paste0(data_save,"halfhourly_sm_eval.rda"))
+
+boot_data <- cbind(eval_sm$benchtod,
+                   eval_sm$benchtoddow[,.(bench_toddow=crps)],
+                   eval_sm$m1[,.(m1=crps)],
+                   eval_sm$m2[,.(m2=crps)],
+                   eval_sm$m4[,.(m4=crps)])
+
+temp <- setorder(boot_data[kfold!="Test",lapply(.SD,mean),by=.(id),.SDcols = 5:ncol(boot_data)],-m2)
+temp[m2>(m1*1.25) | m4>(m1*1.25)]
+
+ids <- temp[m2>(m1*1.25) | m4>(m1*1.25),id]
+
+
+
+eval_sm$m6 <- setorder(rbind(eval_sm$m1[id%in%ids],eval_sm$m2[!id%in%ids]),id,date_time)
+eval_sm$m7 <- setorder(rbind(eval_sm$m1[id%in%ids],eval_sm$m4[!id%in%ids]),id,date_time)
+
+
+hh_sm_eval <- eval_sm
+rm(eval_sm)
+invisible(gc())
+
+
+
+### takes about 1hr
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_mixture_sm_eval_peak.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_mixture_sm_eval_peak.rda"))
+} else{
+  t1 <- proc.time() 
+  crps <- rbindlist(ml_crps_mods(mod_list = hh_sm_models$peak,
+                                 melted_dt = lcl_data[aggregation=="sm"],
+                                 sort_cols = c("aggregation","date_time"),
+                                 quantiles = seq(0.01,0.99,0.01)),
+                    idcol = "id")
+  crps[kfold!="Test",kfold:="All_cv"]
+  print(proc.time()-t1)
+  
+  save(crps,file = paste0(data_save,"halfhourly_mixture_sm_eval_peak.rda"),compress = "xz")
+  
+}
+
+hh_sm_eval$peak <- crps
+rm(crps)
+
+
+
+### takes about 5hrs
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_mixture_sm_eval_blend.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_mixture_sm_eval_blend.rda"))
+} else{
+  t1 <- proc.time() 
+  crps <- rbindlist(ml_crps_mods(mod_list = hh_sm_models$blend,
+                                 melted_dt = lcl_data[aggregation=="sm"],
+                                 sort_cols = c("aggregation","date_time"),
+                                 quantiles = seq(0.01,0.99,0.01)),
+                    idcol = "id")
+  crps[kfold!="Test",kfold:="All_cv"]
+  print(proc.time()-t1)
+  
+  save(crps,file = paste0(data_save,"halfhourly_mixture_sm_eval_blend.rda"),compress = "xz")
+  
+}
+
+hh_sm_eval$blend <- crps
+
+
+### takes about 5hrs
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_mixture_sm_eval_blend_opt.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_mixture_sm_eval_blend_opt.rda"))
+} else{
+  t1 <- proc.time() 
+  crps <- rbindlist(ml_crps_mods(mod_list = hh_sm_models$blend_opt,
+                                 melted_dt = lcl_data[aggregation=="sm"],
+                                 sort_cols = c("aggregation","date_time"),
+                                 quantiles = seq(0.01,0.99,0.01)),
+                    idcol = "id")
+  crps[kfold!="Test",kfold:="All_cv"]
+  print(proc.time()-t1)
+  
+  save(crps,file = paste0(data_save,"halfhourly_mixture_sm_eval_blend_opt.rda"),compress = "xz")
+  
+}
+
+hh_sm_eval$blend_opt <- crps
+
+
+
+### takes about 5hrs
+l_file <- TRUE
+if(file.exists(paste0(data_save,"halfhourly_mixture_sm_eval_blend_opthh.rda")) & isTRUE(l_file)){
+  load(paste0(data_save,"halfhourly_mixture_sm_eval_blend_opthh.rda"))
+} else{
+  t1 <- proc.time()
+  crps <- rbindlist(ml_crps_mods(mod_list = hh_sm_models$blend_opthh,
+                                 melted_dt = lcl_data[aggregation=="sm"],
+                                 sort_cols = c("aggregation","date_time"),
+                                 quantiles = seq(0.01,0.99,0.01)),
+                    idcol = "id")
+  crps[kfold!="Test",kfold:="All_cv"]
+  print(proc.time()-t1)
+
+  save(crps,file = paste0(data_save,"halfhourly_mixture_sm_eval_blend_opthh.rda"),compress = "xz")
+
+}
+
+hh_sm_eval$blend_opthh <- crps
+
+rm(crps)
+invisible(gc())
+
+
+
+boot_data <- cbind(hh_sm_eval$benchtod,
+                   hh_sm_eval$benchtoddow[,.(bench2=crps)],
+                   hh_sm_eval$m7[,.(m7=crps)],
+                   hh_sm_eval$peak[,.(peak=crps)],
+                   hh_sm_eval$blend[,.(blend=crps)],
+                   hh_sm_eval$blend_opt[,.(blend2=crps)],
+                   hh_sm_eval$blend_opthh[,.(blend3=crps)])
+
+setnames(boot_data,"crps","bench1")
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench1",
+                     nboot = 100)
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench1 [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold)
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+```
+
+
+Let's have a look at just `blend`
+
+- the `blend` model looks to be more skilful than the `m7` model - nice! by about 0.5\% or so tho...
+
+
+```{r}
+
+
+boot_dt[model_id!="peak",ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench1 [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold)
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+temp <- boot_data[,lapply(.SD,mean),by=.(id,kfold),.SDcols = 5:ncol(boot_data)]
+temp <- temp[,lapply(.SD,function(x){((bench1-x)/bench1)*100}),
+          .SDcols=3:ncol(temp),keyby=.(id,kfold)]
+temp <- melt(temp,id.vars = c("id","kfold"))
+
+ggplot(data=temp[!variable%in%c("bench1","peak")],aes(x = value))+
+  geom_histogram(stat = "density")+
+  facet_grid(kfold~variable)+
+  geom_vline(xintercept = 0,colour = "red", linetype = "dashed")
+
+
+
+```
+
+
+
+Let's just now evaluate during the peak hours
+
+- nice (:
+- note that the `peak` model is the upper limit of the skill if we had perfect knowledge of **when** the peaks will occur
+
+```{r}
+
+
+
+boot_data <- boot_data[lcl_data[aggregation=="sm",.(id,date_time,peak_ind)],on=.(id,date_time)]
+boot_data <- boot_data[peak_ind==1]
+boot_data[,peak_ind:=NULL]
+
+
+boot_dt <- eval_boot(melted_evaldt = boot_data,
+                     by_cols = c("aggregation","kfold"),
+                     eval_cols = colnames(boot_data)[-c(1:4)],
+                     skillscore_b = "bench1")
+
+
+
+boot_dt[,ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench1[%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold)
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+
+```
+
+
+
+Let's now remove the `peak` forecast
+
+- our forecasts are more skilful during peak hours by around 6-7\%  compared to `m7`
+- note that the skill seems to reduce at the lower aggregations because it's more difficult to forecast **when** the peak will occur at this level
+- we are also more skilful than `bench2` by 1.5-2\% and around 5\% compared to the reference score `bench1`
+
+```{r}
+
+
+boot_dt[!model_id%in%c("peak"),ggplot(data=.SD, aes(x=model_id,y=score)) + labs(y = "crps improvement over bench1 [%]")
+        +geom_boxplot()
+        +facet_grid(aggregation~kfold,scales = "free_y")
+        +theme(legend.position="top")
+        +geom_hline(yintercept = 0,colour = "red", linetype = "dashed")]
+
+
+
+
+```
+
+Here we visualise the per-node improvement by showing a histogram of the per-node skill scores **during the peak half hours**. 
+
+
+```{r message=FALSE,warning=FALSE,results='hide'}
+
+
+temp <- boot_data[,lapply(.SD,mean),by=.(id,kfold),.SDcols = 5:ncol(boot_data)]
+temp <- temp[,lapply(.SD,function(x){((bench1-x)/bench1)*100}),
+          .SDcols=3:ncol(temp),keyby=.(id,kfold)]
+temp <- melt(temp,id.vars = c("id","kfold"))
+
+ggplot(data=temp[variable!="bench1"],aes(x = value))+
+  geom_histogram(stat = "density")+
+  facet_grid(kfold~variable)+
+  geom_vline(xintercept = 0,colour = "red", linetype = "dashed")
+
+
+
+```
+
+
+PIT
+
+```{r}
+
+
+mods <- c("m7","blend","blend_opt","blend_opthh")
+
+hh_sm_eval_pit <- lapply(mods,function(x){
+  
+  rbindlist(lapply(names(hh_sm_models[[x]]),function(y){
+    
+  
+    pit_out <- lcl_data[id==y,.(id,aggregation,date_time,peak_ind,kfold,demand)]
+    pit_out[,pit := PIT(hh_sm_models[[x]][[y]],obs = demand)]
+    pit_out[,demand:=NULL]
+    pit_out[kfold!="Test",kfold:="All_cv"]
+
+  }))
+  
+  
+})
+names(hh_sm_eval_pit) <- mods
+
+hh_sm_eval_pit <- rbindlist(hh_sm_eval_pit,idcol = "model_id")
+
+
+temp <- hh_sm_eval_pit[,as.list(quick_hist(pit, breaks=20)),by=.(aggregation,kfold,model_id)]
+
+temp[,model_id:=factor(model_id,levels = mods)]
+
+ggplot(data=temp, aes(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)) +
+  labs(y = "density [-]", x = " probability level") +
+  geom_rect(fill = "grey75",color = "white")+
+  geom_hline(aes(yintercept = 1,colour = "ideal"), linetype = "dashed")+
+  facet_grid(aggregation+kfold~model_id, scales = "free_y")+
+  theme(legend.position="top")
+
+
+
+
+```
+
+
+
+Now for the `m7` model
+
+
+```{r animation.hook="gifski", interval = 0.5, warning = FALSE}
+
+
+set.seed(3)
+sample_ids <- sort(lcl_data[aggregation=="sm",sample(unique(id),6)])
+date_oi  <- lcl_data[,sample(unique(date_uk),1)]
+date_oi <- date_oi+1:7*60*60*24
+
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+
+  
+for(j in seq_along(date_oi)){
+  par(mfrow=c(2,3))
+  for(i in sample_ids){
+    
+    
+    inds <- lcl_data[id==i][date_uk==date_oi[j],which=T] 
+    mqr_tmp <-  as.MultiQR.ppd_lite(hh_sm_models$m7[[i]],
+                                    quantiles = seq(0.01,0.99,0.01),
+                                    index = inds)
+    
+    plot(mqr_tmp,q50_line = TRUE,
+         main=paste0(i," --- m7 --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=lcl_data[id==i,range(demand)])
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+  }
+  
+  
+  
+}
+
+
+
+```
+
+
+Now for the `blend` model
+
+
+```{r animation.hook="gifski", interval = 0.5, warning = FALSE}
+
+
+par(mar=c(3,3,1.5,1))  # Trim margin around plot [b,l,t,r]
+par(tcl=0.35)  # Switch tick marks to insides of axes
+par(mgp=c(1.5,0.2,0))  # Set margin lines; default c(3,1,0) [title,labels,line]
+par(xaxs="r",yaxs="r")  # Extend axis limits by 4% ("i" does no extension)
+
+
+for(j in seq_along(date_oi)){
+  par(mfrow=c(2,3))
+  for(i in sample_ids){
+    
+    
+    inds <- lcl_data[id==i][date_uk==date_oi[j],which=T] 
+    mqr_tmp <-  as.MultiQR.exp_mixture(hh_sm_models$blend[[i]],
+                                       quantiles = seq(0.01,0.99,0.01),
+                                       index = inds)
+    
+    plot(mqr_tmp,q50_line = TRUE,
+         main=paste0(i," --- blend --- ",as.character(date_oi[j])),
+         cols = colorRampPalette(c("gold", "red")),
+         ylim=lcl_data[id==i,range(demand)])
+    lines(lcl_data[id==i][date_uk==date_oi[j],demand])
+  }
+  
+  
+  
+}
+
+
+
+```
+
+
+# Session info
+
+
+```{r}
+
+hh_agg_models <- hh_agg_models[c("bench","m8","blend")]
+hh_agg_eval <- hh_agg_eval[c("bench","m8","blend")]
+hh_agg_eval_rel <- hh_agg_eval_rel[c("bench","m8","blend")]
+
+
+hh_sm_models <- hh_sm_models[c("bench_tod","m7","blend")]
+hh_sm_eval <- hh_sm_eval[c("benchtod","m7","blend")]
+# fix daft naming mistake...meh
+names(hh_sm_eval) <- c("bench_tod","m7","blend")
+# hh_sm_eval_rel <- eval_sm_rel[c("benchtod","m6","m7")]
+# names(hh_sm_eval_rel) <- c("bench_tod","m6","m7")
+
+s_file <- FALSE
+if(s_file | !file.exists(paste0(data_save,"halfhourly_mixture_smfc_out.rda"))){
+save(hh_agg_models, hh_agg_eval, hh_agg_eval_rel,
+     hh_sm_models, hh_sm_eval,file = paste0(data_save,"halfhourly_mixture_smfc_out.rda"),compress = "xz")
+}
+
+
+
+
+```
+
+
+
+
+```{r}
+
+sessionInfo()
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
